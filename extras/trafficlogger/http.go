@@ -53,7 +53,6 @@ func (s *trafficStatsServerImpl) PushTrafficToV2boardInterval(url string, interv
 			fmt.Println("用户流量信息提交失败:", err)
 		}
 	}
-
 }
 
 // 向v2board 提交用户流量使用情况

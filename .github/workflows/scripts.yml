@@ -10,6 +10,8 @@ on:
 
 jobs:
   publish:
+    # 上游官方仓库专用：发布安装脚本到 Cloudflare Pages，fork 无 secrets 会失败
+    if: github.repository == 'HyNetworks/hysteria'
     runs-on: ubuntu-latest
     permissions:
       contents: read

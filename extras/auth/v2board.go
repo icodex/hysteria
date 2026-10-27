@@ -98,7 +98,6 @@ func processUserList(userList []User, trafficlogger server.TrafficLogger) {
 
 // 验证代码
 func (v *V2boardApiProvider) Authenticate(addr net.Addr, auth string, tx uint64) (ok bool, id string) {
-
 	// 获取判断连接用户是否在用户列表内
 	lock.Lock()
 	defer lock.Unlock()
