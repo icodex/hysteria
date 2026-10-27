@@ -29,25 +29,32 @@ const (
 
 var (
 	// These values will be injected by the build system
-	appVersion  = "Unknown"
-	appDate     = "Unknown"
-	appType     = "Unknown" // aka channel
-	appCommit   = "Unknown"
-	appPlatform = "Unknown"
-	appArch     = "Unknown"
+	appVersion   = "Unknown"
+	appDate      = "Unknown"
+	appType      = "Unknown" // aka channel
+	appToolchain = "Unknown"
+	appCommit    = "Unknown"
+	appPlatform  = "Unknown"
+	appArch      = "Unknown"
+	libVersion   = "Unknown"
 
 	appVersionLong = fmt.Sprintf("Version:\t%s\n"+
 		"BuildDate:\t%s\n"+
 		"BuildType:\t%s\n"+
+		"Toolchain:\t%s\n"+
 		"CommitHash:\t%s\n"+
 		"Platform:\t%s\n"+
-		"Architecture:\t%s",
-		appVersion, appDate, appType, appCommit, appPlatform, appArch)
+		"Architecture:\t%s\n"+
+		"Libraries:\tquic-go=%s",
+		appVersion, appDate, appType, appToolchain, appCommit, appPlatform, appArch, libVersion)
 
 	appAboutLong = fmt.Sprintf("%s\n%s\n%s\n\n%s", appLogo, appDesc, appAuthors, appVersionLong)
 )
 
-var logger *zap.Logger
+var (
+	logger       *zap.Logger
+	defaultViper *viper.Viper
+)
 
 // Flags
 var (
@@ -61,7 +68,7 @@ var rootCmd = &cobra.Command{
 	Use:   "hysteria",
 	Short: appDesc,
 	Long:  appAboutLong,
-	Run:   runClient, // Default to client mode
+	Run:   runClientCmd, // Default to client mode
 }
 
 var logLevelMap = map[string]zapcore.Level{
@@ -116,15 +123,16 @@ func initFlags() {
 }
 
 func initConfig() {
+	defaultViper = viper.New()
 	if cfgFile != "" {
-		viper.SetConfigFile(cfgFile)
+		defaultViper.SetConfigFile(cfgFile)
 	} else {
-		viper.SetConfigName("config")
-		viper.SetConfigType("yaml")
+		defaultViper.SetConfigName("config")
+		defaultViper.SetConfigType("yaml")
 		viper.SupportedExts = append([]string{"yaml", "yml"}, viper.SupportedExts...)
-		viper.AddConfigPath(".")
-		viper.AddConfigPath("$HOME/.hysteria")
-		viper.AddConfigPath("/etc/hysteria/")
+		defaultViper.AddConfigPath(".")
+		defaultViper.AddConfigPath("$HOME/.hysteria")
+		defaultViper.AddConfigPath("/etc/hysteria/")
 	}
 }
 

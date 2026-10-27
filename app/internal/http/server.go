@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	httpClientTimeout = 10 * time.Second
+	httpResponseHeaderTimeout = 10 * time.Second
 )
 
 // Server is an HTTP server using a Hysteria client as outbound.
@@ -59,8 +59,8 @@ func (s *Server) dispatch(conn net.Conn) {
 			authOK := false
 			// Check the Proxy-Authorization header
 			pAuth := req.Header.Get("Proxy-Authorization")
-			if strings.HasPrefix(pAuth, "Basic ") {
-				userPass, err := base64.URLEncoding.DecodeString(pAuth[6:])
+			if strings.HasPrefix(strings.ToLower(pAuth), "basic ") {
+				userPass, err := base64.StdEncoding.DecodeString(pAuth[6:])
 				if err == nil {
 					userPassParts := strings.SplitN(string(userPass), ":", 2)
 					if len(userPassParts) == 2 {
@@ -235,11 +235,11 @@ func (s *Server) initHTTPClient() {
 				// HyClient doesn't support context for now
 				return s.HyClient.TCP(addr)
 			},
+			ResponseHeaderTimeout: httpResponseHeaderTimeout,
 		},
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
-		Timeout: httpClientTimeout,
 	}
 }
 

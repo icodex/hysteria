@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"net"
 	"net/http"
 	"net/url"
@@ -35,8 +36,10 @@ type HyUDPConn interface {
 }
 
 type HandshakeInfo struct {
-	UDPEnabled bool
-	Tx         uint64 // 0 if using BBR
+	UDPEnabled  bool
+	Tx          uint64 // 0 if using BBR
+	ServerAddr  net.Addr
+	ECHAccepted bool
 }
 
 func NewClient(config *Config) (Client, *HandshakeInfo, error) {
@@ -57,7 +60,8 @@ type clientImpl struct {
 	config *Config
 
 	pktConn net.PacketConn
-	conn    quic.Connection
+	tr      *quic.Transport
+	conn    *quic.Conn
 
 	udpSM *udpSessionManager
 }
@@ -69,10 +73,12 @@ func (c *clientImpl) connect() (*HandshakeInfo, error) {
 	}
 	// Convert config to TLS config & QUIC config
 	tlsConfig := &tls.Config{
-		ServerName:            c.config.TLSConfig.ServerName,
-		InsecureSkipVerify:    c.config.TLSConfig.InsecureSkipVerify,
-		VerifyPeerCertificate: c.config.TLSConfig.VerifyPeerCertificate,
-		RootCAs:               c.config.TLSConfig.RootCAs,
+		ServerName:                     c.config.TLSConfig.ServerName,
+		InsecureSkipVerify:             c.config.TLSConfig.InsecureSkipVerify,
+		VerifyPeerCertificate:          c.config.TLSConfig.VerifyPeerCertificate,
+		RootCAs:                        c.config.TLSConfig.RootCAs,
+		GetClientCertificate:           c.config.TLSConfig.GetClientCertificate,
+		EncryptedClientHelloConfigList: c.config.TLSConfig.ECHConfigList,
 	}
 	quicConfig := &quic.Config{
 		InitialStreamReceiveWindow:     c.config.QUICConfig.InitialStreamReceiveWindow,
@@ -83,14 +89,25 @@ func (c *clientImpl) connect() (*HandshakeInfo, error) {
 		KeepAlivePeriod:                c.config.QUICConfig.KeepAlivePeriod,
 		DisablePathMTUDiscovery:        c.config.QUICConfig.DisablePathMTUDiscovery,
 		EnableDatagrams:                true,
+		MaxDatagramFrameSize:           protocol.MaxDatagramFrameSize,
+		OmitMaxDatagramFrameSize:       true,
+		DisablePathManager:             true,
+		ChromeParrot:                   !c.config.QUICConfig.DisableChromeParrot,
+	}
+	tr := &quic.Transport{Conn: pktConn, DisableGSO: c.config.QUICConfig.DisableGSO}
+	if !c.config.QUICConfig.DisableChromeParrot {
+		// Chrome uses a zero-length source connection ID. This has to be set on the
+		// Transport, since it fixes the length at which incoming packets' connection
+		// IDs are parsed; leaving it default yields 4-byte IDs, visible on the wire.
+		tr.ConnectionIDGenerator = quic.ZeroLengthConnectionIDGenerator{}
 	}
 	// Prepare RoundTripper
-	var conn quic.EarlyConnection
-	rt := &http3.RoundTripper{
+	var conn *quic.Conn
+	rt := &http3.Transport{
 		TLSClientConfig: tlsConfig,
 		QUICConfig:      quicConfig,
-		Dial: func(ctx context.Context, _ string, tlsCfg *tls.Config, cfg *quic.Config) (quic.EarlyConnection, error) {
-			qc, err := quic.DialEarly(ctx, pktConn, c.config.ServerAddr, tlsCfg, cfg)
+		Dial: func(ctx context.Context, _ string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
+			qc, err := tr.DialEarly(ctx, c.config.ServerAddr, tlsCfg, cfg)
 			if err != nil {
 				return nil, err
 			}
@@ -117,11 +134,13 @@ func (c *clientImpl) connect() (*HandshakeInfo, error) {
 		if conn != nil {
 			_ = conn.CloseWithError(closeErrCodeProtocolError, "")
 		}
+		_ = tr.Close()
 		_ = pktConn.Close()
 		return nil, coreErrs.ConnectError{Err: err}
 	}
 	if resp.StatusCode != protocol.StatusAuthOK {
 		_ = conn.CloseWithError(closeErrCodeProtocolError, "")
+		_ = tr.Close()
 		_ = pktConn.Close()
 		return nil, coreErrs.AuthError{StatusCode: resp.StatusCode}
 	}
@@ -130,8 +149,8 @@ func (c *clientImpl) connect() (*HandshakeInfo, error) {
 	var actualTx uint64
 	if authResp.RxAuto {
 		// Server asks client to use bandwidth detection,
-		// ignore local bandwidth config and use BBR
-		congestion.UseBBR(conn)
+		// ignore local bandwidth config and use the configured congestion controller.
+		congestion.UseConfigured(conn, c.config.CongestionConfig.Type, c.config.CongestionConfig.BBRProfile)
 	} else {
 		// actualTx = min(serverRx, clientTx)
 		actualTx = authResp.Rx
@@ -140,27 +159,30 @@ func (c *clientImpl) connect() (*HandshakeInfo, error) {
 			actualTx = c.config.BandwidthConfig.MaxTx
 		}
 		if actualTx > 0 {
-			congestion.UseBrutal(conn, actualTx)
+			congestion.UseBrutal(conn, actualTx, c.config.BandwidthConfig.DisableLossCompensation)
 		} else {
-			// We don't know our own bandwidth either, use BBR
-			congestion.UseBBR(conn)
+			// We don't know our own bandwidth either, use the configured congestion controller.
+			congestion.UseConfigured(conn, c.config.CongestionConfig.Type, c.config.CongestionConfig.BBRProfile)
 		}
 	}
 	_ = resp.Body.Close()
 
 	c.pktConn = pktConn
+	c.tr = tr
 	c.conn = conn
 	if authResp.UDPEnabled {
 		c.udpSM = newUDPSessionManager(&udpIOImpl{Conn: conn})
 	}
 	return &HandshakeInfo{
-		UDPEnabled: authResp.UDPEnabled,
-		Tx:         actualTx,
+		UDPEnabled:  authResp.UDPEnabled,
+		Tx:          actualTx,
+		ServerAddr:  c.config.ServerAddr,
+		ECHAccepted: conn.ConnectionState().TLS.ECHAccepted,
 	}, nil
 }
 
 // openStream wraps the stream with QStream, which handles Close() properly
-func (c *clientImpl) openStream() (quic.Stream, error) {
+func (c *clientImpl) openStream() (*utils.QStream, error) {
 	stream, err := c.conn.OpenStream()
 	if err != nil {
 		return nil, err
@@ -217,26 +239,30 @@ func (c *clientImpl) UDP() (HyUDPConn, error) {
 
 func (c *clientImpl) Close() error {
 	_ = c.conn.CloseWithError(closeErrCodeOK, "")
+	_ = c.tr.Close()
 	_ = c.pktConn.Close()
 	return nil
 }
 
+var nonPermanentErrors = []error{
+	quic.StreamLimitReachedError{},
+}
+
 // wrapIfConnectionClosed checks if the error returned by quic-go
-// indicates that the QUIC connection has been permanently closed,
-// and if so, wraps the error with coreErrs.ClosedError.
-// PITFALL: sometimes quic-go has "internal errors" that are not net.Error,
-// but we still need to treat them as ClosedError.
+// is recoverable (listed in nonPermanentErrors) or permanent.
+// Recoverable errors are returned as-is,
+// permanent ones are wrapped as ClosedError.
 func wrapIfConnectionClosed(err error) error {
-	netErr, ok := err.(net.Error)
-	if !ok || !netErr.Temporary() {
-		return coreErrs.ClosedError{Err: err}
-	} else {
-		return err
+	for _, e := range nonPermanentErrors {
+		if errors.Is(err, e) {
+			return err
+		}
 	}
+	return coreErrs.ClosedError{Err: err}
 }
 
 type tcpConn struct {
-	Orig             quic.Stream
+	Orig             *utils.QStream
 	PseudoLocalAddr  net.Addr
 	PseudoRemoteAddr net.Addr
 	Established      bool
@@ -286,7 +312,7 @@ func (c *tcpConn) SetWriteDeadline(t time.Time) error {
 }
 
 type udpIOImpl struct {
-	Conn quic.Connection
+	Conn *quic.Conn
 }
 
 func (io *udpIOImpl) ReceiveMessage() (*protocol.UDPMessage, error) {

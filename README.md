@@ -46,4 +46,3 @@ ghcr.io/cedar2025/hysteria:latest
 ### docker 仓库
 ```
 docker pull ghcr.io/cedar2025/hysteria:latest
-```

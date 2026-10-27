@@ -2,12 +2,17 @@ package server
 
 import (
 	"context"
+	crand "crypto/rand"
 	"crypto/tls"
+	"errors"
+	"math/rand"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/apernet/quic-go"
 	"github.com/apernet/quic-go/http3"
+	"github.com/apernet/quic-go/quicvarint"
 
 	"github.com/apernet/hysteria/core/v2/internal/congestion"
 	"github.com/apernet/hysteria/core/v2/internal/protocol"
@@ -24,14 +29,28 @@ type Server interface {
 	Close() error
 }
 
+func convertToStdTLSConfig(config *Config) *tls.Config {
+	var clientAuth tls.ClientAuthType
+	if config.TLSConfig.ClientCAs != nil {
+		clientAuth = tls.RequireAndVerifyClientCert
+	} else {
+		clientAuth = tls.NoClientCert
+	}
+	return http3.ConfigureTLSConfig(&tls.Config{
+		Certificates:                config.TLSConfig.Certificates,
+		GetCertificate:              config.TLSConfig.GetCertificate,
+		ClientCAs:                   config.TLSConfig.ClientCAs,
+		ClientAuth:                  clientAuth,
+		EncryptedClientHelloKeys:    config.TLSConfig.ECHKeys,
+		GetEncryptedClientHelloKeys: config.TLSConfig.GetECHKeys,
+	})
+}
+
 func NewServer(config *Config) (Server, error) {
 	if err := config.fill(); err != nil {
 		return nil, err
 	}
-	tlsConfig := http3.ConfigureTLSConfig(&tls.Config{
-		Certificates:   config.TLSConfig.Certificates,
-		GetCertificate: config.TLSConfig.GetCertificate,
-	})
+	tlsConfig := convertToStdTLSConfig(config)
 	quicConfig := &quic.Config{
 		InitialStreamReceiveWindow:     config.QUICConfig.InitialStreamReceiveWindow,
 		MaxStreamReceiveWindow:         config.QUICConfig.MaxStreamReceiveWindow,
@@ -41,20 +60,46 @@ func NewServer(config *Config) (Server, error) {
 		MaxIncomingStreams:             config.QUICConfig.MaxIncomingStreams,
 		DisablePathMTUDiscovery:        config.QUICConfig.DisablePathMTUDiscovery,
 		EnableDatagrams:                true,
+		MaxDatagramFrameSize:           protocol.MaxDatagramFrameSize,
+		AssumePeerMaxDatagramFrameSize: protocol.MaxDatagramFrameSize,
+		DisablePathManager:             true,
 	}
-	listener, err := quic.Listen(config.Conn, tlsConfig, quicConfig)
+	tr := &quic.Transport{
+		Conn:       config.Conn,
+		DisableGSO: config.QUICConfig.DisableGSO,
+	}
+	// A nil key means quic-go never sends stateless resets. Clients then have to
+	// wait for the idle timeout to notice the server is gone, so keep them on
+	// unless the user explicitly asks otherwise.
+	if !config.QUICConfig.DisableStatelessReset {
+		srk := config.StatelessResetKey
+		if srk == nil {
+			var k quic.StatelessResetKey
+			if _, err := crand.Read(k[:]); err != nil {
+				return nil, err
+			}
+			srk = &k
+		}
+		tr.StatelessResetKey = srk
+	}
+	listener, err := tr.Listen(tlsConfig, quicConfig)
 	if err != nil {
-		_ = config.Conn.Close()
+		err = errors.Join(err, tr.Close(), config.Conn.Close())
+		if config.Cleanup != nil {
+			err = errors.Join(err, config.Cleanup.Close())
+		}
 		return nil, err
 	}
 	return &serverImpl{
 		config:   config,
+		tr:       tr,
 		listener: listener,
 	}, nil
 }
 
 type serverImpl struct {
 	config   *Config
+	tr       *quic.Transport
 	listener *quic.Listener
 }
 
@@ -69,16 +114,18 @@ func (s *serverImpl) Serve() error {
 }
 
 func (s *serverImpl) Close() error {
-	err := s.listener.Close()
-	_ = s.config.Conn.Close()
+	err := errors.Join(s.listener.Close(), s.tr.Close(), s.config.Conn.Close())
+	if s.config.Cleanup != nil {
+		err = errors.Join(err, s.config.Cleanup.Close())
+	}
 	return err
 }
 
-func (s *serverImpl) handleClient(conn quic.Connection) {
+func (s *serverImpl) handleClient(conn *quic.Conn) {
 	handler := newH3sHandler(s.config, conn)
 	h3s := http3.Server{
-		Handler:        handler,
-		StreamHijacker: handler.ProxyStreamHijacker,
+		Handler:          handler,
+		StreamDispatcher: handler.ProxyStreamHijacker,
 	}
 	err := h3s.ServeQUICConn(conn)
 	// If the client is authenticated, we need to log the disconnect event
@@ -95,19 +142,21 @@ func (s *serverImpl) handleClient(conn quic.Connection) {
 
 type h3sHandler struct {
 	config *Config
-	conn   quic.Connection
+	conn   *quic.Conn
 
 	authenticated bool
 	authMutex     sync.Mutex
 	authID        string
+	connID        uint32 // a random id for dump streams
 
 	udpSM *udpSessionManager // Only set after authentication
 }
 
-func newH3sHandler(config *Config, conn quic.Connection) *h3sHandler {
+func newH3sHandler(config *Config, conn *quic.Conn) *h3sHandler {
 	return &h3sHandler{
 		config: config,
 		conn:   conn,
+		connID: rand.Uint32(),
 	}
 }
 
@@ -133,8 +182,8 @@ func (h *h3sHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			h.authenticated = true
 			h.authID = id
 			if h.config.IgnoreClientBandwidth {
-				// Ignore client bandwidth, always use BBR
-				congestion.UseBBR(h.conn)
+				// Ignore client bandwidth and use the configured congestion controller.
+				congestion.UseConfigured(h.conn, h.config.CongestionConfig.Type, h.config.CongestionConfig.BBRProfile)
 				actualTx = 0
 			} else {
 				// actualTx = min(serverTx, clientRx)
@@ -144,10 +193,10 @@ func (h *h3sHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					actualTx = h.config.BandwidthConfig.MaxTx
 				}
 				if actualTx > 0 {
-					congestion.UseBrutal(h.conn, actualTx)
+					congestion.UseBrutal(h.conn, actualTx, h.config.BandwidthConfig.DisableLossCompensation)
 				} else {
-					// Client doesn't know its own bandwidth, use BBR
-					congestion.UseBBR(h.conn)
+					// Client doesn't know its own bandwidth, use the configured congestion controller.
+					congestion.UseConfigured(h.conn, h.config.CongestionConfig.Type, h.config.CongestionConfig.BBRProfile)
 				}
 			}
 			// Auth OK, send response
@@ -172,7 +221,8 @@ func (h *h3sHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					sm := newUDPSessionManager(
 						&udpIOImpl{h.conn, id, h.config.TrafficLogger, h.config.RequestHook, h.config.Outbound},
 						&udpEventLoggerImpl{h.conn, id, h.config.EventLogger},
-						h.config.UDPIdleTimeout)
+						h.config.UDPIdleTimeout,
+					)
 					h.udpSM = sm
 					go sm.Run()
 				}()
@@ -187,30 +237,51 @@ func (h *h3sHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (h *h3sHandler) ProxyStreamHijacker(ft http3.FrameType, id quic.ConnectionTracingID, stream quic.Stream, err error) (bool, error) {
+func (h *h3sHandler) ProxyStreamHijacker(ft http3.FrameType, stream *quic.Stream, err error) (bool, error) {
 	if err != nil || !h.authenticated {
 		return false, nil
 	}
 
-	// Wraps the stream with QStream, which handles Close() properly
-	stream = &utils.QStream{Stream: stream}
-
 	switch ft {
 	case protocol.FrameTypeTCPRequest:
-		go h.handleTCPRequest(stream)
+		// StreamDispatcher only peeks the frame type. Consume it so ReadTCPRequest
+		// starts at address length, matching pre-upgrade StreamHijacker behavior.
+		if _, err := quicvarint.Read(quicvarint.NewReader(stream)); err != nil {
+			return false, err
+		}
+		// Wraps the stream with QStream, which handles Close() properly
+		qStream := &utils.QStream{Stream: stream}
+		go h.handleTCPRequest(qStream)
 		return true, nil
 	default:
 		return false, nil
 	}
 }
 
-func (h *h3sHandler) handleTCPRequest(stream quic.Stream) {
+func (h *h3sHandler) handleTCPRequest(stream *utils.QStream) {
+	trafficLogger := h.config.TrafficLogger
+	streamStats := &StreamStats{
+		AuthID:      h.authID,
+		ConnID:      h.connID,
+		InitialTime: time.Now(),
+	}
+	streamStats.State.Store(StreamStateInitial)
+	streamStats.LastActiveTime.Store(time.Now())
+	defer func() {
+		streamStats.State.Store(StreamStateClosed)
+	}()
+	if trafficLogger != nil {
+		trafficLogger.TraceStream(stream, streamStats)
+		defer trafficLogger.UntraceStream(stream)
+	}
+
 	// Read request
 	reqAddr, err := protocol.ReadTCPRequest(stream)
 	if err != nil {
 		_ = stream.Close()
 		return
 	}
+	streamStats.ReqAddr.Store(reqAddr)
 	// Call the hook if set
 	var putback []byte
 	var hooked bool
@@ -220,12 +291,14 @@ func (h *h3sHandler) handleTCPRequest(stream quic.Stream) {
 		// so that the client will send whatever request the hook wants to see.
 		// This is essentially a server-side fast-open.
 		if hooked {
+			streamStats.State.Store(StreamStateHooking)
 			_ = protocol.WriteTCPResponse(stream, true, "RequestHook enabled")
 			putback, err = h.config.RequestHook.TCP(stream, &reqAddr)
 			if err != nil {
 				_ = stream.Close()
 				return
 			}
+			streamStats.setHookedReqAddr(reqAddr)
 		}
 	}
 	// Log the event
@@ -233,6 +306,7 @@ func (h *h3sHandler) handleTCPRequest(stream quic.Stream) {
 		h.config.EventLogger.TCPRequest(h.conn.RemoteAddr(), h.authID, reqAddr)
 	}
 	// Dial target
+	streamStats.State.Store(StreamStateConnecting)
 	tConn, err := h.config.Outbound.TCP(reqAddr)
 	if err != nil {
 		if !hooked {
@@ -248,13 +322,15 @@ func (h *h3sHandler) handleTCPRequest(stream quic.Stream) {
 	if !hooked {
 		_ = protocol.WriteTCPResponse(stream, true, "Connected")
 	}
+	streamStats.State.Store(StreamStateEstablished)
 	// Put back the data if the hook requested
 	if len(putback) > 0 {
-		_, _ = tConn.Write(putback)
+		n, _ := tConn.Write(putback)
+		streamStats.Tx.Add(uint64(n))
 	}
 	// Start proxying
-	if h.config.TrafficLogger != nil {
-		err = copyTwoWayWithLogger(h.authID, stream, tConn, h.config.TrafficLogger)
+	if trafficLogger != nil {
+		err = copyTwoWayEx(h.authID, stream, tConn, trafficLogger, streamStats)
 	} else {
 		// Use the fast path if no traffic logger is set
 		err = copyTwoWay(stream, tConn)
@@ -282,7 +358,7 @@ func (h *h3sHandler) masqHandler(w http.ResponseWriter, r *http.Request) {
 
 // udpIOImpl is the IO implementation for udpSessionManager with TrafficLogger support
 type udpIOImpl struct {
-	Conn          quic.Connection
+	Conn          *quic.Conn
 	AuthID        string
 	TrafficLogger TrafficLogger
 	RequestHook   RequestHook
@@ -330,11 +406,11 @@ func (io *udpIOImpl) SendMessage(buf []byte, msg *protocol.UDPMessage) error {
 	return io.Conn.SendDatagram(buf[:msgN])
 }
 
-func (io *udpIOImpl) Hook(data []byte, reqAddr *string) error {
+func (io *udpIOImpl) Hook(packets [][]byte, reqAddr *string) (bool, error) {
 	if io.RequestHook != nil && io.RequestHook.Check(true, *reqAddr) {
-		return io.RequestHook.UDP(data, reqAddr)
+		return io.RequestHook.UDP(packets, reqAddr)
 	} else {
-		return nil
+		return true, nil
 	}
 }
 
@@ -342,8 +418,12 @@ func (io *udpIOImpl) UDP(reqAddr string) (UDPConn, error) {
 	return io.Outbound.UDP(reqAddr)
 }
 
+func (io *udpIOImpl) CheckUDP(reqAddr string) error {
+	return io.Outbound.CheckUDP(reqAddr)
+}
+
 type udpEventLoggerImpl struct {
-	Conn        quic.Connection
+	Conn        *quic.Conn
 	AuthID      string
 	EventLogger EventLogger
 }

@@ -26,6 +26,8 @@ DESC = "Hyperbole is the official build script for Hysteria."
 
 BUILD_DIR = "build"
 
+GO_WORK_FILE = "go.work"
+
 CORE_SRC_DIR = "./core"
 EXTRAS_SRC_DIR = "./extras"
 APP_SRC_DIR = "./app"
@@ -74,6 +76,9 @@ ARCH_ALIASES = {
         "GOARCH": "amd64",
         "GOAMD64": "v3",
     },
+    "loong64": {
+        "GOARCH": "loong64",
+    },
 }
 
 
@@ -87,6 +92,34 @@ def check_command(args):
         return False
 
 
+def parse_go_version(str):
+    match = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", str)
+    if not match:
+        return None
+    major, minor, patch = match.groups()
+    return (int(major), int(minor), int(patch) if patch else 0)
+
+
+def get_required_go_version():
+    try:
+        with open(GO_WORK_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("go "):
+                    return parse_go_version(line[3:].strip())
+    except Exception:
+        pass
+    return None
+
+
+def get_go_version():
+    try:
+        output = subprocess.check_output(["go", "env", "GOVERSION"]).decode().strip()
+        return parse_go_version(output)
+    except Exception:
+        return None
+
+
 def check_build_env():
     if not check_command(["git", "--version"]):
         print("Git is not installed. Please install Git and try again.")
@@ -97,6 +130,18 @@ def check_build_env():
     if not check_command(["go", "version"]):
         print("Go is not installed. Please install Go and try again.")
         return False
+    required = get_required_go_version()
+    if required:
+        installed = get_go_version()
+        if installed and installed < required:
+            print(
+                "Go %s or newer is required (found %s). Please update Go and try again."
+                % (
+                    ".".join(map(str, required)),
+                    ".".join(map(str, installed)),
+                )
+            )
+            return False
     return True
 
 
@@ -145,10 +190,31 @@ def get_app_commit():
     return app_commit
 
 
+def get_toolchain():
+    try:
+        output = subprocess.check_output(["go", "version"]).decode().strip()
+        if output.startswith("go version "):
+            output = output[11:]
+        return output
+    except Exception:
+        return "Unknown"
+
+
 def get_current_os_arch():
     d_os = subprocess.check_output(["go", "env", "GOOS"]).decode().strip()
     d_arch = subprocess.check_output(["go", "env", "GOARCH"]).decode().strip()
     return (d_os, d_arch)
+
+
+def get_lib_version():
+    try:
+        with open(CORE_SRC_DIR + "/go.mod") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("github.com/apernet/quic-go"):
+                    return line.split(" ")[1].strip()
+    except Exception:
+        return "Unknown"
 
 
 def get_app_platforms():
@@ -176,8 +242,12 @@ def cmd_build(pprof=False, release=False, race=False):
     os.makedirs(BUILD_DIR, exist_ok=True)
 
     app_version = get_app_version()
-    app_date = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    app_date = datetime.datetime.now(datetime.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    app_toolchain = get_toolchain()
     app_commit = get_app_commit()
+    lib_version = get_lib_version()
 
     ldflags = [
         "-X",
@@ -190,7 +260,11 @@ def cmd_build(pprof=False, release=False, race=False):
         + ("release" if release else "dev")
         + ("-pprof" if pprof else ""),
         "-X",
+        '"' + APP_SRC_CMD_PKG + ".appToolchain=" + app_toolchain + '"',
+        "-X",
         APP_SRC_CMD_PKG + ".appCommit=" + app_commit,
+        "-X",
+        APP_SRC_CMD_PKG + ".libVersion=" + lib_version,
     ]
     if release:
         ldflags.append("-s")
@@ -235,6 +309,12 @@ def cmd_build(pprof=False, release=False, race=False):
         plat_ldflags.append(APP_SRC_CMD_PKG + ".appPlatform=" + os_name)
         plat_ldflags.append("-X")
         plat_ldflags.append(APP_SRC_CMD_PKG + ".appArch=" + arch)
+        if os_name == "android":
+            # github.com/wlynxg/anet uses //go:linkname to reach internal net
+            # symbols (net.zoneCache), which Go 1.23+ rejects unless the
+            # linker is told to skip the check. Without this the Android
+            # build fails with: "link: ... invalid reference to net.zoneCache".
+            plat_ldflags.append("-checklinkname=0")
 
         cmd = [
             "go",
@@ -267,8 +347,12 @@ def cmd_run(args, pprof=False, race=False):
         return
 
     app_version = get_app_version()
-    app_date = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    app_date = datetime.datetime.now(datetime.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    app_toolchain = get_toolchain()
     app_commit = get_app_commit()
+    lib_version = get_lib_version()
 
     current_os, current_arch = get_current_os_arch()
 
@@ -280,11 +364,15 @@ def cmd_run(args, pprof=False, race=False):
         "-X",
         APP_SRC_CMD_PKG + ".appType=dev-run",
         "-X",
+        '"' + APP_SRC_CMD_PKG + ".appToolchain=" + app_toolchain + '"',
+        "-X",
         APP_SRC_CMD_PKG + ".appCommit=" + app_commit,
         "-X",
         APP_SRC_CMD_PKG + ".appPlatform=" + current_os,
         "-X",
         APP_SRC_CMD_PKG + ".appArch=" + current_arch,
+        "-X",
+        APP_SRC_CMD_PKG + ".libVersion=" + lib_version,
     ]
 
     cmd = ["go", "run", "-ldflags", " ".join(ldflags)]
@@ -314,6 +402,25 @@ def cmd_format():
         subprocess.check_call(["gofumpt", "-w", "-l", "-extra", "."])
     except Exception:
         print("Failed to format code")
+
+
+def cmd_format_check():
+    if not check_command(["gofumpt", "-version"]):
+        print("gofumpt is not installed. Please install gofumpt and try again.")
+        sys.exit(1)
+
+    try:
+        output = (
+            subprocess.check_output(["gofumpt", "-l", "-extra", "."]).decode().strip()
+        )
+    except Exception:
+        print("Failed to check code format")
+        sys.exit(1)
+
+    if output:
+        print("The following files are not properly formatted:")
+        print(output)
+        sys.exit(1)
 
 
 def cmd_mockgen():
@@ -460,6 +567,9 @@ def main():
     # Format
     p_cmd.add_parser("format", help="Format the code")
 
+    # Format check
+    p_cmd.add_parser("format-check", help="Check code format")
+
     # Mockgen
     p_cmd.add_parser("mockgen", help="Generate mock interfaces")
 
@@ -493,6 +603,8 @@ def main():
         cmd_build(args.pprof, args.release, args.race)
     elif args.command == "format":
         cmd_format()
+    elif args.command == "format-check":
+        cmd_format_check()
     elif args.command == "mockgen":
         cmd_mockgen()
     elif args.command == "protogen":

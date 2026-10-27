@@ -25,6 +25,7 @@ FROM alpine AS dist
 RUN if [ ! -e /etc/nsswitch.conf ]; then echo 'hosts: files dns' > /etc/nsswitch.conf; fi
 
 # bash is used for debugging, tzdata is used to add timezone information.
+# iptables and nftables are used to change firewall rules.
 # Install ca-certificates to ensure no CA certificate errors.
 #
 # Do not try to add the "--no-cache" option when there are multiple "apk"
@@ -32,7 +33,7 @@ RUN if [ ! -e /etc/nsswitch.conf ]; then echo 'hosts: files dns' > /etc/nsswitch
 COPY ./entrypoint /usr/local/bin/entrypoint
 RUN set -ex \
     && apk upgrade \
-    && apk add bash tzdata ca-certificates \
+    && apk add bash tzdata ca-certificates iptables nftables \
     && rm -rf /var/cache/apk/* \
     && chmod +x /usr/local/bin/entrypoint
 

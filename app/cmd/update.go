@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 	"go.uber.org/zap"
 
 	"github.com/apernet/hysteria/app/v2/internal/utils"
@@ -19,28 +20,33 @@ var checkUpdateCmd = &cobra.Command{
 	Use:   "check-update",
 	Short: "Check for updates",
 	Long:  "Check for updates.",
-	Run:   runCheckUpdate,
+	Run:   runCheckUpdateCmd,
 }
 
 func init() {
 	rootCmd.AddCommand(checkUpdateCmd)
 }
 
-func runCheckUpdate(cmd *cobra.Command, args []string) {
-	logger.Info("checking for updates",
+func runCheckUpdateCmd(cmd *cobra.Command, args []string) {
+	logger.Info(
+		"checking for updates",
 		zap.String("version", appVersion),
 		zap.String("platform", appPlatform),
 		zap.String("arch", appArch),
 		zap.String("channel", appType),
 	)
+	runCheckUpdate(defaultViper)
+}
 
+func runCheckUpdate(v *viper.Viper) {
 	checker := utils.NewServerUpdateChecker(appVersion, appPlatform, appArch, appType)
 	resp, err := checker.Check()
 	if err != nil {
 		logger.Fatal("failed to check for updates", zap.Error(err))
 	}
 	if resp.HasUpdate {
-		logger.Info("update available",
+		logger.Info(
+			"update available",
 			zap.String("version", resp.LatestVersion),
 			zap.String("url", resp.URL),
 			zap.Bool("urgent", resp.Urgent),
@@ -65,7 +71,8 @@ func runCheckUpdateClient(hyClient client.Client) {
 func checkUpdateRoutine(checker *utils.UpdateChecker) {
 	ticker := time.NewTicker(updateCheckInterval)
 	for {
-		logger.Debug("checking for updates",
+		logger.Debug(
+			"checking for updates",
 			zap.String("version", appVersion),
 			zap.String("platform", appPlatform),
 			zap.String("arch", appArch),
@@ -75,7 +82,8 @@ func checkUpdateRoutine(checker *utils.UpdateChecker) {
 		if err != nil {
 			logger.Debug("failed to check for updates", zap.Error(err))
 		} else if resp.HasUpdate {
-			logger.Info("update available",
+			logger.Info(
+				"update available",
 				zap.String("version", resp.LatestVersion),
 				zap.String("url", resp.URL),
 				zap.Bool("urgent", resp.Urgent),

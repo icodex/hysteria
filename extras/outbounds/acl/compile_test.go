@@ -1,6 +1,7 @@
 package acl
 
 import (
+	"fmt"
 	"net"
 	"testing"
 
@@ -96,6 +97,12 @@ func TestCompile(t *testing.T) {
 			ProtoPort:     "tcp/6881-6889",
 			HijackAddress: "",
 		},
+		{
+			Outbound:      "ob1",
+			Address:       "dotpattern.test.", // trailing dot in pattern should be normalized away
+			ProtoPort:     "tcp/443",
+			HijackAddress: "",
+		},
 	}
 	comp, err := Compile[int](rules, map[string]int{
 		"ob1": ob1,
@@ -179,6 +186,30 @@ func TestCompile(t *testing.T) {
 		},
 		{
 			host: HostInfo{
+				Name: "crap.v2ex.com",
+			},
+			proto:        ProtocolTCP,
+			port:         81,
+			wantOutbound: 0,
+		},
+		{
+			host: HostInfo{
+				Name: "crap.v2ex.com",
+			},
+			proto:        ProtocolUDP,
+			port:         80,
+			wantOutbound: ob3,
+		},
+		{
+			host: HostInfo{
+				Name: "crap.v2ex.com",
+			},
+			proto:        ProtocolUDP,
+			port:         81,
+			wantOutbound: ob3,
+		},
+		{
+			host: HostInfo{
 				IPv4: net.ParseIP("210.140.92.187"),
 			},
 			proto:        ProtocolTCP,
@@ -258,12 +289,60 @@ func TestCompile(t *testing.T) {
 			wantOutbound: ob6, // match range port rule 6881-6889
 			wantIP:       nil,
 		},
+		{
+			host: HostInfo{
+				Name: "crap.v2ex.com.", // trailing dot must not bypass exact domain rule
+			},
+			proto:        ProtocolTCP,
+			port:         80,
+			wantOutbound: ob1,
+			wantIP:       net.ParseIP("2.2.2.2"),
+		},
+		{
+			host: HostInfo{
+				Name: "hoho.v2ex.com.", // trailing dot must not bypass wildcard domain rule
+			},
+			proto:        ProtocolUDP,
+			port:         9999,
+			wantOutbound: ob3,
+			wantIP:       nil,
+		},
+		{
+			host: HostInfo{
+				Name: "real.microsoft.com.", // trailing dot must not bypass suffix domain rule
+			},
+			proto:        ProtocolUDP,
+			port:         5353,
+			wantOutbound: ob5,
+			wantIP:       nil,
+		},
+		{
+			host: HostInfo{
+				Name: "microsoft.com...", // multiple trailing dots must also be normalized
+			},
+			proto:        ProtocolTCP,
+			port:         6000,
+			wantOutbound: ob5,
+			wantIP:       nil,
+		},
+		{
+			host: HostInfo{
+				Name: "dotpattern.test", // host without dot must match rule whose pattern had a trailing dot
+			},
+			proto:        ProtocolTCP,
+			port:         443,
+			wantOutbound: ob1,
+			wantIP:       nil,
+		},
 	}
 
 	for _, test := range tests {
-		gotOutbound, gotIP := comp.Match(test.host, test.proto, test.port)
-		assert.Equal(t, test.wantOutbound, gotOutbound)
-		assert.Equal(t, test.wantIP, gotIP)
+		testName := fmt.Sprintf("%s#%s#%d", test.host, test.proto, test.port)
+		t.Run(testName, func(t *testing.T) {
+			gotOutbound, gotIP := comp.Match(test.host, test.proto, test.port)
+			assert.Equal(t, test.wantOutbound, gotOutbound)
+			assert.Equal(t, test.wantIP, gotIP)
+		})
 	}
 
 	// Test Invalid Port Range Rule
