@@ -21,6 +21,7 @@ require (
 	github.com/andybalholm/brotli v1.1.0 // indirect
 	github.com/database64128/netx-go v0.1.1 // indirect
 	github.com/google/gopacket v1.1.19 // indirect
+	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/huin/goupnp v1.2.0 // indirect
 	github.com/jackpal/go-nat-pmp v1.0.2 // indirect
 	github.com/klauspost/compress v1.17.9 // indirect

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/apernet/hysteria/core/v2/server"
@@ -23,6 +24,9 @@ type V2boardApiProvider struct {
 var (
 	usersMap map[string]User
 	lock     sync.Mutex
+
+	// WSActive 为 true 时面板走 WS 推送，REST 轮询让位
+	WSActive atomic.Bool
 )
 
 type User struct {
@@ -66,6 +70,9 @@ func UpdateUsers(url string, interval time.Duration, trafficlogger server.Traffi
 	defer ticker.Stop()
 
 	for range ticker.C {
+		if WSActive.Load() {
+			continue
+		}
 		userList, err := getUserList(url)
 		if err != nil {
 			fmt.Println("Error:", err)
@@ -75,8 +82,13 @@ func UpdateUsers(url string, interval time.Duration, trafficlogger server.Traffi
 	}
 }
 
-// 处理用户列表的逻辑
+// processUserList 处理用户列表的逻辑
 func processUserList(userList []User, trafficlogger server.TrafficLogger) {
+	ApplyUsers(userList, trafficlogger)
+}
+
+// ApplyUsers 全量替换用户列表，被移除的用户触发踢出
+func ApplyUsers(userList []User, trafficlogger server.TrafficLogger) {
 	lock.Lock()
 	defer lock.Unlock()
 
@@ -94,6 +106,33 @@ func processUserList(userList []User, trafficlogger server.TrafficLogger) {
 	}
 
 	usersMap = newUsersMap
+}
+
+// ApplyUserDelta 增量更新用户（面板 sync.user.delta：add 带 uuid，remove 只带 id）
+func ApplyUserDelta(add bool, users []User, trafficlogger server.TrafficLogger) {
+	lock.Lock()
+	defer lock.Unlock()
+
+	if usersMap == nil {
+		usersMap = make(map[string]User)
+	}
+	for _, user := range users {
+		if add {
+			if user.UUID != "" {
+				usersMap[user.UUID] = user
+			}
+			continue
+		}
+		for uuid, u := range usersMap {
+			if u.ID == user.ID {
+				delete(usersMap, uuid)
+				if trafficlogger != nil {
+					trafficlogger.NewKick(strconv.Itoa(user.ID))
+				}
+				break
+			}
+		}
+	}
 }
 
 // 验证代码

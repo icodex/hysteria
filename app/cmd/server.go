@@ -1841,8 +1841,35 @@ func runServer(v *viper.Viper) {
 
 	// 面板节点配置变化时退出进程，由 docker restart 策略拉起新配置
 	configChangeChan := make(chan struct{}, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	if v2boardWatchURL != "" {
-		go watchV2boardConfig(v2boardWatchURL, v2boardPullInterval, v2boardInitialInfo, configChangeChan)
+		go watchV2boardConfig(ctx, v2boardWatchURL, v2boardPullInterval, v2boardInitialInfo, configChangeChan)
+		go auth.ReconnectLoop(ctx, config.V2board.ApiHost, config.V2board.ApiKey, int(config.V2board.NodeID), auth.WSHandlers{
+			OnConfig: func(raw json.RawMessage) {
+				var info ResponseNodeInfo
+				if err := json.Unmarshal(raw, &info); err != nil {
+					logger.Error("failed to parse ws sync.config", zap.Error(err))
+					return
+				}
+				if v2boardNodeInfoChanged(v2boardInitialInfo, info) {
+					logger.Warn("panel node config changed (ws)",
+						zap.Uint("old_port", v2boardInitialInfo.ServerPort), zap.Uint("new_port", info.ServerPort),
+						zap.String("old_obfs", v2boardObfsPassword(v2boardInitialInfo)), zap.String("new_obfs", v2boardObfsPassword(info)),
+					)
+					select {
+					case configChangeChan <- struct{}{}:
+					default:
+					}
+				}
+			},
+			OnUsers: func(users []auth.User) {
+				auth.ApplyUsers(users, hyConfig.TrafficLogger)
+			},
+			OnUserDelta: func(add bool, users []auth.User) {
+				auth.ApplyUserDelta(add, users, hyConfig.TrafficLogger)
+			},
+		})
 	}
 
 	select {
@@ -1902,10 +1929,19 @@ func v2boardNodeInfoChanged(a, b ResponseNodeInfo) bool {
 		v2boardObfsPassword(a) != v2boardObfsPassword(b)
 }
 
-func watchV2boardConfig(nodeInfoURL string, interval time.Duration, initial ResponseNodeInfo, changed chan<- struct{}) {
+func watchV2boardConfig(ctx context.Context, nodeInfoURL string, interval time.Duration, initial ResponseNodeInfo, changed chan<- struct{}) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	for range ticker.C {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		if auth.WSActive.Load() {
+			// WS 推送在线，REST 轮询让位
+			continue
+		}
 		info, err := fetchV2boardNodeInfo(nodeInfoURL)
 		if err != nil {
 			// 面板抖动不杀节点，等下个周期重试
