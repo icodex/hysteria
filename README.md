@@ -41,8 +41,8 @@ docker run -itd --restart=always  --network=host \
  -e apiKey=xxxxxxxxxxxxxxxxxxxxx \
  -e domain=hy2.example.com  \
  -e nodeID=1 \
-ghcr.io/cedar2025/hysteria:latest
+ghcr.io/icodex/hysteria:latest
 ```
 ### docker 仓库
 ```
-docker pull ghcr.io/cedar2025/hysteria:latest
+docker pull ghcr.io/icodex/hysteria:latest
