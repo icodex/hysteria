@@ -1757,31 +1757,19 @@ func runServer(v *viper.Viper) {
 		logger.Fatal("failed to parse server config", zap.Error(err))
 	}
 	// 如果配置了v2board 则自动获取监听端口、obfs
+	var v2boardWatchURL string
+	var v2boardPullInterval time.Duration
+	var v2boardInitialInfo ResponseNodeInfo
 	if config.V2board != nil && config.V2board.ApiHost != "" {
-		// 创建一个url.Values来存储查询参数
 		queryParams := url.Values{
 			"token":     {config.V2board.ApiKey},
 			"node_id":   {strconv.Itoa(int(config.V2board.NodeID))},
 			"node_type": {"hysteria"},
 		}
 		nodeInfoUrl := config.V2board.ApiHost + "/api/v1/server/UniProxy/config?" + queryParams.Encode()
-		resp, err := http.Get(nodeInfoUrl)
+		responseNodeInfo, err := fetchV2boardNodeInfo(nodeInfoUrl)
 		if err != nil {
-			// 处理错误
-			fmt.Println("HTTP GET 请求出错:", err)
 			logger.Fatal("failed to client v2board api to get nodeInfo", zap.Error(err))
-		}
-		defer resp.Body.Close()
-		// 读取响应数据
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			logger.Fatal("failed to read v2board reaponse", zap.Error(err))
-		}
-		// 解析JSON数据
-		var responseNodeInfo ResponseNodeInfo
-		err = json.Unmarshal(body, &responseNodeInfo)
-		if err != nil {
-			logger.Fatal("failed to unmarshal v2board reaponse", zap.Error(err))
 		}
 		// 给 hy的端口、obfs、上行下行进行赋值
 		if responseNodeInfo.ServerPort != 0 {
@@ -1796,14 +1784,15 @@ func runServer(v *viper.Viper) {
 		if responseNodeInfo.Version == 1 {
 			logger.Warn("panel node is hysteria v1, this server only speaks hysteria2")
 		}
-		// Xboard 下发 obfs 为类型、obfs-password 为密码；官方 V2board 下发 obfs 即密码
-		obfsPassword := responseNodeInfo.ObfsPassword
-		if obfsPassword == "" {
-			obfsPassword = responseNodeInfo.Obfs
-		}
-		if obfsPassword != "" {
+		if obfsPassword := v2boardObfsPassword(responseNodeInfo); obfsPassword != "" {
 			config.Obfs.Type = "salamander"
 			config.Obfs.Salamander.Password = obfsPassword
+		}
+		v2boardWatchURL = nodeInfoUrl
+		v2boardInitialInfo = responseNodeInfo
+		v2boardPullInterval = 5 * time.Second
+		if config.V2board.PullInterval > 0 {
+			v2boardPullInterval = config.V2board.PullInterval
 		}
 	}
 	hyConfig, err := config.Config()
@@ -1850,6 +1839,12 @@ func runServer(v *viper.Viper) {
 		serveErrChan <- s.Serve()
 	}()
 
+	// 面板节点配置变化时退出进程，由 docker restart 策略拉起新配置
+	configChangeChan := make(chan struct{}, 1)
+	if v2boardWatchURL != "" {
+		go watchV2boardConfig(v2boardWatchURL, v2boardPullInterval, v2boardInitialInfo, configChangeChan)
+	}
+
 	select {
 	case <-signalChan:
 		logger.Info("received signal, shutting down gracefully")
@@ -1859,9 +1854,76 @@ func runServer(v *viper.Viper) {
 		if err := <-serveErrChan; err != nil {
 			logger.Info("server stopped", zap.Error(err))
 		}
+	case <-configChangeChan:
+		logger.Info("panel node config changed, restarting server to apply")
+		if err := s.Close(); err != nil {
+			logger.Error("failed to shut down server cleanly", zap.Error(err))
+		}
+		if err := <-serveErrChan; err != nil {
+			logger.Info("server stopped", zap.Error(err))
+		}
 	case err := <-serveErrChan:
 		if err != nil {
 			logger.Fatal("failed to serve", zap.Error(err))
+		}
+	}
+}
+
+func fetchV2boardNodeInfo(nodeInfoURL string) (ResponseNodeInfo, error) {
+	resp, err := http.Get(nodeInfoURL)
+	if err != nil {
+		return ResponseNodeInfo{}, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return ResponseNodeInfo{}, err
+	}
+	var info ResponseNodeInfo
+	if err := json.Unmarshal(body, &info); err != nil {
+		return ResponseNodeInfo{}, err
+	}
+	return info, nil
+}
+
+// Xboard 下发 obfs 为类型、obfs-password 为密码；官方 V2board 下发 obfs 即密码
+func v2boardObfsPassword(i ResponseNodeInfo) string {
+	if i.ObfsPassword != "" {
+		return i.ObfsPassword
+	}
+	return i.Obfs
+}
+
+func v2boardNodeInfoChanged(a, b ResponseNodeInfo) bool {
+	return a.ServerPort != b.ServerPort ||
+		a.Version != b.Version ||
+		a.UpMbps != b.UpMbps ||
+		a.DownMbps != b.DownMbps ||
+		v2boardObfsPassword(a) != v2boardObfsPassword(b)
+}
+
+func watchV2boardConfig(nodeInfoURL string, interval time.Duration, initial ResponseNodeInfo, changed chan<- struct{}) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for range ticker.C {
+		info, err := fetchV2boardNodeInfo(nodeInfoURL)
+		if err != nil {
+			// 面板抖动不杀节点，等下个周期重试
+			logger.Error("failed to fetch v2board nodeInfo", zap.Error(err))
+			continue
+		}
+		if v2boardNodeInfoChanged(initial, info) {
+			logger.Warn("panel node config changed",
+				zap.Uint("old_port", initial.ServerPort), zap.Uint("new_port", info.ServerPort),
+				zap.String("old_obfs", v2boardObfsPassword(initial)), zap.String("new_obfs", v2boardObfsPassword(info)),
+				zap.Uint("old_up_mbps", initial.UpMbps), zap.Uint("new_up_mbps", info.UpMbps),
+				zap.Uint("old_down_mbps", initial.DownMbps), zap.Uint("new_down_mbps", info.DownMbps),
+			)
+			select {
+			case changed <- struct{}{}:
+			default:
+			}
+			return
 		}
 	}
 }
