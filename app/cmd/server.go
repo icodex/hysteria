@@ -1512,25 +1512,30 @@ func (c *serverConfig) fillEventLogger(hyConfig *server.Config) error {
 }
 
 func (c *serverConfig) fillTrafficLogger(hyConfig *server.Config) error {
-	pullInterval := time.Second * 5
-	if c.V2board.PullInterval > 0 {
-		pullInterval = time.Duration(c.V2board.PullInterval) * time.Second
+	v2boardEnabled := c.V2board != nil && c.V2board.ApiHost != ""
+	var pullInterval, pushInterval time.Duration
+	var userURL, pushURL string
+	if v2boardEnabled {
+		pullInterval = 5 * time.Second
+		if c.V2board.PullInterval > 0 {
+			pullInterval = c.V2board.PullInterval
+		}
+		pushInterval = 60 * time.Second
+		if c.V2board.PushInterval > 0 {
+			pushInterval = c.V2board.PushInterval
+		}
+		userURL = fmt.Sprintf("%s?token=%s&node_id=%d&node_type=hysteria", c.V2board.ApiHost+"/api/v1/server/UniProxy/user", c.V2board.ApiKey, c.V2board.NodeID)
+		pushURL = fmt.Sprintf("%s?token=%s&node_id=%d&node_type=hysteria", c.V2board.ApiHost+"/api/v1/server/UniProxy/push", c.V2board.ApiKey, c.V2board.NodeID)
 	}
-	pushInterval := time.Second * 60
-	if c.V2board.PushInterval > 0 {
-		pushInterval = time.Duration(c.V2board.PushInterval) * time.Second
-	}
-	userURL := fmt.Sprintf("%s?token=%s&node_id=%d&node_type=hysteria", c.V2board.ApiHost+"/api/v1/server/UniProxy/user", c.V2board.ApiKey, c.V2board.NodeID)
-	pushURL := fmt.Sprintf("%s?token=%s&node_id=%d&node_type=hysteria", c.V2board.ApiHost+"/api/v1/server/UniProxy/push", c.V2board.ApiKey, c.V2board.NodeID)
 	if c.TrafficStats.Listen != "" {
 		tss := trafficlogger.NewTrafficStatsServer(c.TrafficStats.Secret)
 		hyConfig.TrafficLogger = tss
-		if c.V2board != nil && c.V2board.ApiHost != "" {
-			go auth.UpdateUsers(userURL, pullInterval, hyConfig.TrafficLogger)
-			go hyConfig.TrafficLogger.PushTrafficToV2boardInterval(pushURL, pushInterval)
+		if v2boardEnabled {
+			go auth.UpdateUsers(userURL, pullInterval, tss)
+			go tss.PushTrafficToV2boardInterval(pushURL, pushInterval)
 		}
 		go runTrafficStatsServer(c.TrafficStats.Listen, tss)
-	} else {
+	} else if v2boardEnabled {
 		go auth.UpdateUsers(userURL, pullInterval, nil)
 	}
 
@@ -1724,13 +1729,15 @@ func (c *serverConfig) Config() (*server.Config, error) {
 }
 
 type ResponseNodeInfo struct {
-	Host       string `json:"host"`
-	ServerPort uint   `json:"server_port"`
-	ServerName string `json:"server_name"`
-	UpMbps     uint   `json:"down_mbps"`
-	DownMbps   uint   `json:"up_mbps"`
-	Obfs       string `json:"obfs"`
-	BaseConfig struct {
+	Host         string `json:"host"`
+	ServerPort   uint   `json:"server_port"`
+	ServerName   string `json:"server_name"`
+	UpMbps       uint   `json:"down_mbps"`
+	DownMbps     uint   `json:"up_mbps"`
+	Version      int    `json:"version"`
+	Obfs         string `json:"obfs"`
+	ObfsPassword string `json:"obfs-password"`
+	BaseConfig   struct {
 		PushInterval int `json:"push_interval"`
 		PullInterval int `json:"pull_interval"`
 	} `json:"base_config"`
@@ -1786,9 +1793,17 @@ func runServer(v *viper.Viper) {
 		if responseNodeInfo.UpMbps != 0 {
 			config.Bandwidth.Up = strconv.Itoa(int(responseNodeInfo.UpMbps)) + "Mbps"
 		}
-		if responseNodeInfo.Obfs != "" {
+		if responseNodeInfo.Version == 1 {
+			logger.Warn("panel node is hysteria v1, this server only speaks hysteria2")
+		}
+		// Xboard 下发 obfs 为类型、obfs-password 为密码；官方 V2board 下发 obfs 即密码
+		obfsPassword := responseNodeInfo.ObfsPassword
+		if obfsPassword == "" {
+			obfsPassword = responseNodeInfo.Obfs
+		}
+		if obfsPassword != "" {
 			config.Obfs.Type = "salamander"
-			config.Obfs.Salamander.Password = responseNodeInfo.Obfs
+			config.Obfs.Salamander.Password = obfsPassword
 		}
 	}
 	hyConfig, err := config.Config()
