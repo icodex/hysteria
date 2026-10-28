@@ -45,12 +45,21 @@ func TestServer(t *testing.T) {
 	}
 	go s.Serve(l)
 
-	// Start a test HTTP & HTTPS server
+	// Start a test HTTP & HTTPS server.
+	// Bind synchronously before launching the Python client: ListenAndServe
+	// binds asynchronously, and under -race the goroutine can lose that race
+	// against the first Python request, flaking the test.
+	hl, err := net.Listen("tcp", "127.0.0.1:18081")
+	assert.NoError(t, err)
+	defer hl.Close()
+	htls, err := net.Listen("tcp", "127.0.0.1:18082")
+	assert.NoError(t, err)
+	defer htls.Close()
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("control is an illusion"))
 	})
-	go http.ListenAndServe("127.0.0.1:18081", nil)
-	go http.ListenAndServeTLS("127.0.0.1:18082", testCertFile, testKeyFile, nil)
+	go http.Serve(hl, nil)
+	go http.ServeTLS(htls, nil, testCertFile, testKeyFile)
 
 	// Run the Python test script
 	cmd := exec.Command("python", "server_test.py")
