@@ -30,15 +30,22 @@ type TrafficStatsServer interface {
 func NewTrafficStatsServer(secret string) TrafficStatsServer {
 	return &trafficStatsServerImpl{
 		StatsMap:  make(map[string]*trafficStatsEntry),
-		KickMap:   make(map[string]struct{}),
+		KickMap:   make(map[string]time.Time),
 		OnlineMap: make(map[string]int),
 		StreamMap: make(map[server.HyStream]*server.StreamStats),
 		Secret:    secret,
 	}
 }
 
-type TrafficPushRequest struct {
-	Data map[string][2]int64
+// pushHTTP 限制提交耗时，防止面板挂起阻塞推送循环
+var pushHTTP = &http.Client{Timeout: 15 * time.Second}
+
+// SetSpeedThrottle 注入面板 per-user 限速回调（v2board speed_limit）。
+// 回调在记账前、拿锁前调用，绝不能持锁等待。
+func SetSpeedThrottle(t TrafficStatsServer, fn func(id string, tx, rx uint64)) {
+	if impl, ok := t.(*trafficStatsServerImpl); ok {
+		impl.SpeedThrottle = fn
+	}
 }
 
 // 定时提交用户流量情况
@@ -55,36 +62,54 @@ func (s *trafficStatsServerImpl) PushTrafficToV2boardInterval(url string, interv
 	}
 }
 
-// 向v2board 提交用户流量使用情况
+// PushTrafficToV2board 先在锁内换出统计快照，再在锁外提交；
+// 提交失败把快照合并回去，流量不丢，也绝不持锁等网络。
 func (s *trafficStatsServerImpl) PushTrafficToV2board(url string) error {
-	s.Mutex.Lock()         // 写锁，阻止其他操作 StatsMap 的并发访问
-	defer s.Mutex.Unlock() // 确保在函数退出时释放写锁
+	s.Mutex.Lock()
+	old := s.StatsMap
+	s.StatsMap = make(map[string]*trafficStatsEntry)
+	s.pruneKicksLocked()
+	s.Mutex.Unlock()
 
-	request := TrafficPushRequest{
-		Data: make(map[string][2]int64),
-	}
-	for id, stats := range s.StatsMap {
-		request.Data[id] = [2]int64{int64(stats.Tx), int64(stats.Rx)}
-	}
-	if len(request.Data) == 0 {
+	if len(old) == 0 {
 		return nil
 	}
-	jsonData, err := json.Marshal(request.Data)
+
+	data := make(map[string][2]int64, len(old))
+	for id, stats := range old {
+		data[id] = [2]int64{int64(stats.Tx), int64(stats.Rx)}
+	}
+	jsonData, err := json.Marshal(data)
 	if err != nil {
+		s.mergeBack(old)
 		return err
 	}
-	resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonData))
+	resp, err := pushHTTP.Post(url, "application/json", bytes.NewBuffer(jsonData))
 	if err != nil {
-		fmt.Println(resp)
+		s.mergeBack(old)
 		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
+		s.mergeBack(old)
 		return errors.New("HTTP request failed with status code: " + resp.Status)
 	}
-	s.StatsMap = make(map[string]*trafficStatsEntry)
-
 	return nil
+}
+
+// mergeBack 提交失败时把换出的统计并回当前表，避免丢流量
+func (s *trafficStatsServerImpl) mergeBack(old map[string]*trafficStatsEntry) {
+	s.Mutex.Lock()
+	defer s.Mutex.Unlock()
+	for id, stats := range old {
+		entry, ok := s.StatsMap[id]
+		if !ok {
+			entry = &trafficStatsEntry{}
+			s.StatsMap[id] = entry
+		}
+		entry.Tx += stats.Tx
+		entry.Rx += stats.Rx
+	}
 }
 
 type trafficStatsServerImpl struct {
@@ -92,8 +117,11 @@ type trafficStatsServerImpl struct {
 	StatsMap  map[string]*trafficStatsEntry
 	OnlineMap map[string]int
 	StreamMap map[server.HyStream]*server.StreamStats
-	KickMap   map[string]struct{}
+	KickMap   map[string]time.Time
 	Secret    string
+	// SpeedThrottle 非 nil 时在记账前对用户限速（v2board speed_limit），
+	// 必须在拿 Mutex 之前调用，绝不能持锁等待
+	SpeedThrottle func(id string, tx, rx uint64)
 }
 
 type trafficStatsEntry struct {
@@ -101,12 +129,28 @@ type trafficStatsEntry struct {
 	Rx uint64 `json:"rx"`
 }
 
+// kickTTL 踢出标记的保留时长：用户一直不重连时条目也不会永久堆积
+const kickTTL = time.Hour
+
+// pruneKicksLocked 清理过期的踢出标记，调用方须已持写锁
+func (s *trafficStatsServerImpl) pruneKicksLocked() {
+	cutoff := time.Now().Add(-kickTTL)
+	for id, at := range s.KickMap {
+		if at.Before(cutoff) {
+			delete(s.KickMap, id)
+		}
+	}
+}
+
 func (s *trafficStatsServerImpl) LogTraffic(id string, tx, rx uint64) (ok bool) {
+	if s.SpeedThrottle != nil {
+		s.SpeedThrottle(id, tx, rx)
+	}
+
 	s.Mutex.Lock()
 	defer s.Mutex.Unlock()
 
-	_, ok = s.KickMap[id]
-	if ok {
+	if _, kicked := s.KickMap[id]; kicked {
 		delete(s.KickMap, id)
 		return false
 	}
@@ -343,7 +387,7 @@ func (s *trafficStatsServerImpl) kick(w http.ResponseWriter, r *http.Request) {
 	}
 	s.Mutex.Lock()
 	for _, id := range ids {
-		s.KickMap[id] = struct{}{}
+		s.KickMap[id] = time.Now()
 	}
 	s.Mutex.Unlock()
 
@@ -353,7 +397,7 @@ func (s *trafficStatsServerImpl) kick(w http.ResponseWriter, r *http.Request) {
 // 踢出用户名单
 func (s *trafficStatsServerImpl) NewKick(id string) bool {
 	s.Mutex.Lock()
-	s.KickMap[id] = struct{}{}
+	s.KickMap[id] = time.Now()
 	s.Mutex.Unlock()
 	return true
 }
