@@ -1555,12 +1555,13 @@ func (c *serverConfig) fillTrafficLogger(hyConfig *server.Config) error {
 		userURL := c.V2board.uniProxyURL("/api/v1/server/UniProxy/user")
 		pushURL := c.V2board.uniProxyURL("/api/v1/server/UniProxy/push")
 		aliveURL := c.V2board.uniProxyURL("/api/v1/server/UniProxy/alive")
+		alivelistURL := c.V2board.uniProxyURL("/api/v1/server/UniProxy/alivelist")
 		statusURL := c.V2board.uniProxyURL("/api/v1/server/UniProxy/status")
 		onlineURL := c.V2board.uniProxyURL("/api/v1/server/UniProxy/online")
 		go auth.UpdateUsers(userURL, pullInterval, tss)
 		go tss.PushTrafficToV2boardInterval(pushURL, pushInterval)
 		// WS 推送在线时由 report.devices/node.status 上报，断开期间 REST 兜底
-		go auth.ReportDevices(aliveURL, pushInterval, auth.DeviceSnapshot)
+		go auth.ReportDevices(aliveURL, alivelistURL, pushInterval, auth.DeviceSnapshot)
 		go auth.ReportStatusLoop(statsLoopCtx(), statusURL, pushInterval,
 			func() map[string]any { return auth.StatusPayload(auth.CollectNodeStats(true)) })
 		go auth.ReportOnlineLoop(statsLoopCtx(), onlineURL, pushInterval, auth.OnlineConnSnapshot)

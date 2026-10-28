@@ -19,11 +19,16 @@ type deviceTracker struct {
 	local    map[int]map[string]int // user id → ip → 连接引用数
 	global   map[int]map[string]bool
 	globalAt time.Time
+	// REST 降级期的全局设备计数（alivelist：uid → distinct IP 数，
+	// 含本节点上报的 IP）。IP 集过期后用它做保守门控。
+	globalCounts   map[int]int
+	globalCountsAt time.Time
 }
 
 var devices = &deviceTracker{
-	local:  make(map[int]map[string]int),
-	global: make(map[int]map[string]bool),
+	local:        make(map[int]map[string]int),
+	global:       make(map[int]map[string]bool),
+	globalCounts: make(map[int]int),
 }
 
 // TrackConnect/TrackDisconnect 由 app 层 serverLogger 的 Connect/Disconnect 调用
@@ -97,9 +102,20 @@ func SetGlobalDevices(users map[int][]string) {
 	devices.mu.Unlock()
 }
 
+// SetGlobalAliveCounts 处理 REST alivelist：{alive: {uid: distinct IP 数}}。
+// WS 断开期间由兜底轮询调用，维持跨节点设备规模的保守视图。
+func SetGlobalAliveCounts(counts map[int]int) {
+	devices.mu.Lock()
+	devices.globalCounts = counts
+	devices.globalCountsAt = time.Now()
+	devices.mu.Unlock()
+}
+
 // deviceLimitReject 新连接设备数门控，true = 拒绝。
 // 与 Xboard-node 一致：本地 + 全局（60s 内有效）合并后按字典序排序，
 // 新 IP 必须排进前 limit 个才放行，保证多节点判定一致。
+// 全局 IP 集过期但有新鲜计数（alivelist）时退化为保守计数门控：
+// 面板计数含本节点 IP，去重总数 ≥ limit 且新 IP 本地未知即拒。
 func deviceLimitReject(userID, limit int, addr net.Addr) bool {
 	if limit <= 0 || addr == nil {
 		return false
@@ -117,31 +133,46 @@ func deviceLimitReject(userID, limit int, addr net.Addr) bool {
 		return false
 	}
 
-	merged := make(map[string]bool, len(local)+4)
-	for k := range local {
-		merged[k] = true
-	}
+	localCount := len(local)
+
 	if time.Since(devices.globalAt) <= time.Minute {
+		// 新鲜全局 IP 集：合并字典序判定
+		merged := make(map[string]bool, localCount+4)
+		for k := range local {
+			merged[k] = true
+		}
 		for k := range devices.global[userID] {
 			merged[k] = true
 		}
-	}
-	if len(merged) < limit {
-		return false
-	}
-
-	ips := make([]string, 0, len(merged)+1)
-	for k := range merged {
-		ips = append(ips, k)
-	}
-	ips = append(ips, ip)
-	sort.Strings(ips)
-	for i := 0; i < limit && i < len(ips); i++ {
-		if ips[i] == ip {
+		if len(merged) < limit {
 			return false
 		}
+		ips := make([]string, 0, len(merged)+1)
+		for k := range merged {
+			ips = append(ips, k)
+		}
+		ips = append(ips, ip)
+		sort.Strings(ips)
+		for i := 0; i < limit && i < len(ips); i++ {
+			if ips[i] == ip {
+				return false
+			}
+		}
+		return true
 	}
-	return true
+
+	if time.Since(devices.globalCountsAt) <= time.Minute {
+		// 降级：仅计数。面板计数含本节点去重 IP，无法做 IP 归因——
+		// 本地尚无该用户连接时（如节点刚重启）不参与判定，避免把
+		// 重连的同一台设备拒之门外；有本地视图时按"其余节点设备数
+		// = 全局计数 - 本地去重 IP"门控。
+		if localCount > 0 {
+			if others := devices.globalCounts[userID] - localCount; others >= limit {
+				return true
+			}
+		}
+	}
+	return localCount >= limit
 }
 
 // DeviceSnapshot 返回本地在线设备表（uid → ips），用于向面板上报
@@ -162,9 +193,10 @@ func DeviceSnapshot() map[int][]string {
 	return out
 }
 
-// ReportDevices REST 兜底：WS 断开期间向面板 POST /alive 上报设备。
+// ReportDevices REST 兜底：WS 断开期间向面板 POST /alive 上报设备，
+// 同时轮询 GET /alivelist 拉全局设备计数，维持跨节点门控的保守视图。
 // 面板以 TTL 300s 过期设备记录，停报后在线状态自动消退。
-func ReportDevices(aliveURL string, interval time.Duration, snapshot func() map[int][]string) {
+func ReportDevices(aliveURL, alivelistURL string, interval time.Duration, snapshot func() map[int][]string) {
 	log.Println("设备在线情况上报已启动,提交周期为:", interval)
 
 	post := func() {
@@ -186,7 +218,31 @@ func ReportDevices(aliveURL string, interval time.Duration, snapshot func() map[
 			log.Println("设备在线上报失败: status", resp.Status)
 		}
 	}
+	pullAlivelist := func() {
+		resp, err := panelHTTP.Get(alivelistURL)
+		if err != nil {
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return
+		}
+		var out struct {
+			Alive map[string]int `json:"alive"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			return
+		}
+		counts := make(map[int]int, len(out.Alive))
+		for k, v := range out.Alive {
+			if uid, err := strconv.Atoi(k); err == nil && v > 0 {
+				counts[uid] = v
+			}
+		}
+		SetGlobalAliveCounts(counts)
+	}
 	post()
+	pullAlivelist()
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -195,5 +251,6 @@ func ReportDevices(aliveURL string, interval time.Duration, snapshot func() map[
 			continue
 		}
 		post()
+		pullAlivelist()
 	}
 }

@@ -2,6 +2,7 @@ package auth
 
 import (
 	"net"
+	"sort"
 	"strconv"
 	"testing"
 	"time"
@@ -30,10 +31,12 @@ func TestTrackConnectDisconnect(t *testing.T) {
 	TrackConnect("5", tcpAddr("2.2.2.2"))
 
 	snap := DeviceSnapshot()
+	sort.Strings(snap[5])
 	assert.Equal(t, []string{"1.1.1.1", "2.2.2.2"}, snap[5])
 
 	TrackDisconnect("5", tcpAddr("1.1.1.1"))
 	snap = DeviceSnapshot()
+	sort.Strings(snap[5])
 	assert.Equal(t, []string{"1.1.1.1", "2.2.2.2"}, snap[5], "refcount still holds one conn from 1.1.1.1")
 
 	TrackDisconnect("5", tcpAddr("1.1.1.1"))
@@ -126,4 +129,35 @@ func TestParseIDIP(t *testing.T) {
 
 	uid, ip = parseIDIP(strconv.Itoa(0), tcpAddr("1.2.3.4"))
 	assert.Zero(t, uid)
+}
+
+func TestDeviceLimitRejectCountsFallback(t *testing.T) {
+	resetDevices()
+	defer resetDevices()
+
+	// 本地无视图时（节点刚重启）：计数无法归因，不参与判定 → 放行
+	SetGlobalAliveCounts(map[int]int{9: 2})
+	devices.mu.Lock()
+	devices.globalAt = time.Now().Add(-2 * time.Minute) // IP 集过期
+	devices.mu.Unlock()
+	assert.False(t, deviceLimitReject(9, 2, tcpAddr("3.3.3.3")), "cold node must not reject on counts alone")
+
+	// 有本地视图（本节点 1 台）：其余节点 = 2-1 = 1 ≥ limit 1 → 新 IP 拒
+	TrackConnect("9", tcpAddr("1.1.1.1"))
+	assert.True(t, deviceLimitReject(9, 1, tcpAddr("3.3.3.3")))
+	// 已知本地 IP 仍放行
+	assert.False(t, deviceLimitReject(9, 2, tcpAddr("1.1.1.1")))
+	// 其余节点数 < limit → 放行（limit 5）
+	assert.False(t, deviceLimitReject(9, 5, tcpAddr("4.4.4.4")))
+
+	// 计数也过期：退回仅本地判定（本地 1 台 < limit 2）
+	devices.mu.Lock()
+	devices.globalCountsAt = time.Now().Add(-2 * time.Minute)
+	devices.mu.Unlock()
+	assert.False(t, deviceLimitReject(9, 2, tcpAddr("5.5.5.5")))
+	// 同 IP 重连（本地已有 2 台、limit 2）——本地满员前已知 IP 恒放行
+	assert.False(t, deviceLimitReject(9, 2, tcpAddr("2.2.2.2")))
+	// 本地满员则拒
+	TrackConnect("9", tcpAddr("2.2.2.2"))
+	assert.True(t, deviceLimitReject(9, 2, tcpAddr("6.6.6.6")))
 }
