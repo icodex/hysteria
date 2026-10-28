@@ -300,6 +300,10 @@ func ReconnectLoop(ctx context.Context, apiHost, token string, nodeID int, h WSH
 		}
 		if backoff < 60*time.Second {
 			backoff *= 2
+		} else {
+			// 退避到顶仍连不上：面板可能换了 WS 地址（或关了推送），
+			// 丢掉缓存 URL 重新走握手发现
+			wsURL = ""
 		}
 	}
 }
