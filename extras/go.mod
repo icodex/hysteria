@@ -6,6 +6,7 @@ require (
 	github.com/apernet/hysteria/core/v2 v2.0.0-00010101000000-000000000000
 	github.com/apernet/quic-go v0.63.1-0.20261004180939-a10df75c260c
 	github.com/database64128/tfo-go/v2 v2.3.3
+	github.com/gorilla/websocket v1.5.3
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/libp2p/go-nat v1.0.1-0.20250821073202-01afc089f138
 	github.com/miekg/dns v1.1.72
@@ -14,6 +15,7 @@ require (
 	github.com/txthinking/socks5 v0.0.0-20230325130024-4230056ae301
 	golang.org/x/crypto v0.54.0
 	golang.org/x/net v0.57.0
+	golang.org/x/time v0.16.0
 	google.golang.org/protobuf v1.36.11
 )
 
@@ -21,7 +23,6 @@ require (
 	github.com/andybalholm/brotli v1.1.0 // indirect
 	github.com/database64128/netx-go v0.1.1 // indirect
 	github.com/google/gopacket v1.1.19 // indirect
-	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/huin/goupnp v1.2.0 // indirect
 	github.com/jackpal/go-nat-pmp v1.0.2 // indirect
 	github.com/klauspost/compress v1.17.9 // indirect

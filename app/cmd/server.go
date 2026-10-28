@@ -104,6 +104,30 @@ type v2boardConfig struct {
 	PushInterval time.Duration `mapstructure:"pushInterval"`
 }
 
+// uniProxyURL 构造面板 UniProxy API 地址
+func (c *v2boardConfig) uniProxyURL(endpoint string) string {
+	queryParams := url.Values{
+		"token":     {c.ApiKey},
+		"node_id":   {strconv.Itoa(int(c.NodeID))},
+		"node_type": {"hysteria"},
+	}
+	return c.ApiHost + endpoint + "?" + queryParams.Encode()
+}
+
+// intervals 返回用户拉取与流量推送周期；面板 base_config 下发的值
+// 由 runServer 写回 PullInterval/PushInterval，故此处只看正负
+func (c *v2boardConfig) intervals() (pull, push time.Duration) {
+	pull = 5 * time.Second
+	if c.PullInterval > 0 {
+		pull = c.PullInterval
+	}
+	push = 60 * time.Second
+	if c.PushInterval > 0 {
+		push = c.PushInterval
+	}
+	return
+}
+
 type serverConfigRealm struct {
 	STUNServers       []string               `mapstructure:"stunServers"`
 	STUNTimeout       time.Duration          `mapstructure:"stunTimeout"`
@@ -1498,7 +1522,7 @@ func (c *serverConfig) fillAuthenticator(hyConfig *server.Config) error {
 		if v2boardConfig.ApiHost == "" || v2boardConfig.ApiKey == "" || v2boardConfig.NodeID == 0 {
 			return configError{Field: "auth.v2board", Err: errors.New("v2board config error")}
 		}
-		hyConfig.Authenticator = &auth.V2boardApiProvider{URL: fmt.Sprintf("%s?token=%s&node_id=%d&node_type=hysteria", c.V2board.ApiHost+"/api/v1/server/UniProxy/user", c.V2board.ApiKey, c.V2board.NodeID)}
+		hyConfig.Authenticator = &auth.V2boardApiProvider{URL: v2boardConfig.uniProxyURL("/api/v1/server/UniProxy/user")}
 
 		return nil
 	default:
@@ -1513,30 +1537,26 @@ func (c *serverConfig) fillEventLogger(hyConfig *server.Config) error {
 
 func (c *serverConfig) fillTrafficLogger(hyConfig *server.Config) error {
 	v2boardEnabled := c.V2board != nil && c.V2board.ApiHost != ""
-	var pullInterval, pushInterval time.Duration
-	var userURL, pushURL string
+	if !v2boardEnabled && c.TrafficStats.Listen == "" {
+		return nil
+	}
+
+	tss := trafficlogger.NewTrafficStatsServer(c.TrafficStats.Secret)
+	trafficlogger.SetSpeedThrottle(tss, auth.Throttle)
+	hyConfig.TrafficLogger = tss
+
 	if v2boardEnabled {
-		pullInterval = 5 * time.Second
-		if c.V2board.PullInterval > 0 {
-			pullInterval = c.V2board.PullInterval
-		}
-		pushInterval = 60 * time.Second
-		if c.V2board.PushInterval > 0 {
-			pushInterval = c.V2board.PushInterval
-		}
-		userURL = fmt.Sprintf("%s?token=%s&node_id=%d&node_type=hysteria", c.V2board.ApiHost+"/api/v1/server/UniProxy/user", c.V2board.ApiKey, c.V2board.NodeID)
-		pushURL = fmt.Sprintf("%s?token=%s&node_id=%d&node_type=hysteria", c.V2board.ApiHost+"/api/v1/server/UniProxy/push", c.V2board.ApiKey, c.V2board.NodeID)
+		pullInterval, pushInterval := c.V2board.intervals()
+		userURL := c.V2board.uniProxyURL("/api/v1/server/UniProxy/user")
+		pushURL := c.V2board.uniProxyURL("/api/v1/server/UniProxy/push")
+		aliveURL := c.V2board.uniProxyURL("/api/v1/server/UniProxy/alive")
+		go auth.UpdateUsers(userURL, pullInterval, tss)
+		go tss.PushTrafficToV2boardInterval(pushURL, pushInterval)
+		// WS 推送在线时由 report.devices 上报，断开期间 REST /alive 兜底
+		go auth.ReportDevices(aliveURL, pushInterval, auth.DeviceSnapshot)
 	}
 	if c.TrafficStats.Listen != "" {
-		tss := trafficlogger.NewTrafficStatsServer(c.TrafficStats.Secret)
-		hyConfig.TrafficLogger = tss
-		if v2boardEnabled {
-			go auth.UpdateUsers(userURL, pullInterval, tss)
-			go tss.PushTrafficToV2boardInterval(pushURL, pushInterval)
-		}
 		go runTrafficStatsServer(c.TrafficStats.Listen, tss)
-	} else if v2boardEnabled {
-		go auth.UpdateUsers(userURL, pullInterval, nil)
 	}
 
 	return nil
@@ -1702,6 +1722,11 @@ func (c *serverConfig) fillMasqHandler(hyConfig *server.Config) error {
 
 // Config validates the fields and returns a ready-to-use Hysteria server config
 func (c *serverConfig) Config() (*server.Config, error) {
+	// 面板同步/推送/WS 只在 auth.type=v2board 时有意义，避免误配后
+	// 拿空 token 无限轮询面板
+	if c.V2board != nil && c.V2board.ApiHost != "" && strings.ToLower(c.Auth.Type) != "v2board" {
+		return nil, configError{Field: "v2board", Err: errors.New("v2board section requires auth.type: v2board")}
+	}
 	hyConfig := &server.Config{}
 	fillers := []func(*server.Config) error{
 		c.fillConn,
@@ -1761,15 +1786,20 @@ func runServer(v *viper.Viper) {
 	var v2boardPullInterval time.Duration
 	var v2boardInitialInfo ResponseNodeInfo
 	if config.V2board != nil && config.V2board.ApiHost != "" {
-		queryParams := url.Values{
-			"token":     {config.V2board.ApiKey},
-			"node_id":   {strconv.Itoa(int(config.V2board.NodeID))},
-			"node_type": {"hysteria"},
-		}
-		nodeInfoUrl := config.V2board.ApiHost + "/api/v1/server/UniProxy/config?" + queryParams.Encode()
-		responseNodeInfo, err := fetchV2boardNodeInfo(nodeInfoUrl)
+		nodeInfoUrl := config.V2board.uniProxyURL("/api/v1/server/UniProxy/config")
+		responseNodeInfo, unchanged, err := fetchV2boardNodeInfo(nodeInfoUrl)
 		if err != nil {
 			logger.Fatal("failed to client v2board api to get nodeInfo", zap.Error(err))
+		}
+		if unchanged {
+			logger.Fatal("unexpected 304 on initial v2board nodeInfo fetch")
+		}
+		// 面板下发的 base_config 间隔优先于本地配置
+		if v := responseNodeInfo.BaseConfig.PullInterval; v > 0 {
+			config.V2board.PullInterval = time.Duration(v) * time.Second
+		}
+		if v := responseNodeInfo.BaseConfig.PushInterval; v > 0 {
+			config.V2board.PushInterval = time.Duration(v) * time.Second
 		}
 		// 给 hy的端口、obfs、上行下行进行赋值
 		if responseNodeInfo.ServerPort != 0 {
@@ -1790,10 +1820,7 @@ func runServer(v *viper.Viper) {
 		}
 		v2boardWatchURL = nodeInfoUrl
 		v2boardInitialInfo = responseNodeInfo
-		v2boardPullInterval = 5 * time.Second
-		if config.V2board.PullInterval > 0 {
-			v2boardPullInterval = config.V2board.PullInterval
-		}
+		v2boardPullInterval, _ = config.V2board.intervals()
 	}
 	hyConfig, err := config.Config()
 	if err != nil {
@@ -1844,8 +1871,10 @@ func runServer(v *viper.Viper) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	if v2boardWatchURL != "" {
+		_, pushInterval := config.V2board.intervals()
 		go watchV2boardConfig(ctx, v2boardWatchURL, v2boardPullInterval, v2boardInitialInfo, configChangeChan)
 		go auth.ReconnectLoop(ctx, config.V2board.ApiHost, config.V2board.ApiKey, int(config.V2board.NodeID), auth.WSHandlers{
+			NodeID: int(config.V2board.NodeID),
 			OnConfig: func(raw json.RawMessage) {
 				var info ResponseNodeInfo
 				if err := json.Unmarshal(raw, &info); err != nil {
@@ -1869,6 +1898,9 @@ func runServer(v *viper.Viper) {
 			OnUserDelta: func(add bool, users []auth.User) {
 				auth.ApplyUserDelta(add, users, hyConfig.TrafficLogger)
 			},
+			OnSyncDevices:        auth.SetGlobalDevices,
+			DeviceSnapshot:       auth.DeviceSnapshot,
+			DeviceReportInterval: pushInterval,
 		})
 	}
 
@@ -1896,21 +1928,13 @@ func runServer(v *viper.Viper) {
 	}
 }
 
-func fetchV2boardNodeInfo(nodeInfoURL string) (ResponseNodeInfo, error) {
-	resp, err := http.Get(nodeInfoURL)
-	if err != nil {
-		return ResponseNodeInfo{}, err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return ResponseNodeInfo{}, err
-	}
+func fetchV2boardNodeInfo(nodeInfoURL string) (ResponseNodeInfo, bool, error) {
 	var info ResponseNodeInfo
-	if err := json.Unmarshal(body, &info); err != nil {
-		return ResponseNodeInfo{}, err
+	unchanged, err := auth.FetchPanelJSON(nodeInfoURL, &info)
+	if err != nil {
+		return ResponseNodeInfo{}, false, err
 	}
-	return info, nil
+	return info, unchanged, nil
 }
 
 // Xboard 下发 obfs 为类型、obfs-password 为密码；官方 V2board 下发 obfs 即密码
@@ -1942,10 +1966,13 @@ func watchV2boardConfig(ctx context.Context, nodeInfoURL string, interval time.D
 			// WS 推送在线，REST 轮询让位
 			continue
 		}
-		info, err := fetchV2boardNodeInfo(nodeInfoURL)
+		info, unchanged, err := fetchV2boardNodeInfo(nodeInfoURL)
 		if err != nil {
 			// 面板抖动不杀节点，等下个周期重试
 			logger.Error("failed to fetch v2board nodeInfo", zap.Error(err))
+			continue
+		}
+		if unchanged {
 			continue
 		}
 		if v2boardNodeInfoChanged(initial, info) {
@@ -2004,10 +2031,12 @@ func geoDownloadErrFunc(err error) {
 type serverLogger struct{}
 
 func (l *serverLogger) Connect(addr net.Addr, id string, tx uint64) {
+	auth.TrackConnect(id, addr)
 	logger.Info("client connected", zap.String("addr", addr.String()), zap.String("id", id), zap.Uint64("tx", tx))
 }
 
 func (l *serverLogger) Disconnect(addr net.Addr, id string, err error) {
+	auth.TrackDisconnect(id, addr)
 	logger.Info("client disconnected", zap.String("addr", addr.String()), zap.String("id", id), zap.Error(err))
 }
 

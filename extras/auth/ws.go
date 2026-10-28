@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -17,12 +18,20 @@ import (
 
 // WSHandlers 处理面板 WS 推送的事件
 type WSHandlers struct {
+	// NodeID 携带在 request.devices / report.devices 消息体里
+	NodeID int
 	// OnConfig 收到 sync.config，raw 为 buildNodeConfig 的原始 JSON
 	OnConfig func(raw json.RawMessage)
 	// OnUsers 收到 sync.users（全量用户列表）
 	OnUsers func(users []User)
 	// OnUserDelta 收到 sync.user.delta（增量，remove 时 user 只保证 ID 有值）
 	OnUserDelta func(add bool, users []User)
+	// OnSyncDevices 收到 sync.devices（面板全局设备表，uid → ips）
+	OnSyncDevices func(users map[int][]string)
+	// DeviceSnapshot 返回本地在线设备表，非 nil 时定期上报 report.devices
+	DeviceSnapshot func() map[int][]string
+	// DeviceReportInterval 为 0 时默认 60s
+	DeviceReportInterval time.Duration
 }
 
 type wsHandshakeResponse struct {
@@ -76,6 +85,10 @@ type wsConfigPayload struct {
 	Config json.RawMessage `json:"config"`
 }
 
+type wsDevicesPayload struct {
+	Users map[string][]string `json:"users"`
+}
+
 // RunWSClient 连接面板 WS 并处理推送，连接期间置 WSActive，断开时返回
 func RunWSClient(wsURL, token string, nodeID int, h WSHandlers) error {
 	u, err := url.Parse(wsURL)
@@ -100,21 +113,69 @@ func RunWSClient(wsURL, token string, nodeID int, h WSHandlers) error {
 
 	pingTicker := time.NewTicker(30 * time.Second)
 	defer pingTicker.Stop()
-	errChan := make(chan error, 2)
+	errChan := make(chan error, 4)
+	// done 关闭后所有辅助 goroutine 退出，避免每次重连泄漏
+	done := make(chan struct{})
+	defer close(done)
+
+	// gorilla/websocket 连接同一时刻只允许一个写 goroutine，
+	// 心跳与读循环的 pong 都必须经过这把锁
+	var writeMu sync.Mutex
+	writeJSON := func(v any) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		return conn.WriteJSON(v)
+	}
 
 	go func() {
-		for range pingTicker.C {
+		for {
+			select {
+			case <-done:
+				return
+			case <-pingTicker.C:
+			}
 			if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(5*time.Second)); err != nil {
 				errChan <- err
 				return
 			}
 			// 应用层 pong 维持面板 node_ws_alive cache
-			if err := conn.WriteJSON(wsMessage{Event: "pong"}); err != nil {
+			if err := writeJSON(wsMessage{Event: "pong"}); err != nil {
 				errChan <- err
 				return
 			}
 		}
 	}()
+
+	// 定期上报本地在线设备，驱动面板 device_limit 全局视图与在线数展示
+	if h.DeviceSnapshot != nil {
+		interval := h.DeviceReportInterval
+		if interval <= 0 {
+			interval = time.Minute
+		}
+		reportTicker := time.NewTicker(interval)
+		defer reportTicker.Stop()
+		go func() {
+			for {
+				select {
+				case <-done:
+					return
+				case <-reportTicker.C:
+				}
+				snap := h.DeviceSnapshot()
+				if len(snap) == 0 {
+					continue
+				}
+				data, merr := json.Marshal(map[string]any{"node_id": h.NodeID, "devices": snap})
+				if merr != nil {
+					continue
+				}
+				if err := writeJSON(wsMessage{Event: "report.devices", Data: data}); err != nil {
+					errChan <- err
+					return
+				}
+			}
+		}()
+	}
 
 	go func() {
 		for {
@@ -130,8 +191,14 @@ func RunWSClient(wsURL, token string, nodeID int, h WSHandlers) error {
 			switch m.Event {
 			case "auth.success":
 				log.Printf("v2board WS auth success")
+				// 拉一次面板全局设备表，供 device_limit 判定
+				if h.OnSyncDevices != nil {
+					if data, err := json.Marshal(map[string]int{"node_id": h.NodeID}); err == nil {
+						_ = writeJSON(wsMessage{Event: "request.devices", Data: data})
+					}
+				}
 			case "ping":
-				_ = conn.WriteJSON(wsMessage{Event: "pong"})
+				_ = writeJSON(wsMessage{Event: "pong"})
 			case "sync.config":
 				if h.OnConfig != nil {
 					var p wsConfigPayload
@@ -154,7 +221,18 @@ func RunWSClient(wsURL, token string, nodeID int, h WSHandlers) error {
 					}
 				}
 			case "sync.devices":
-				// 设备数限制本节点未实现，忽略
+				if h.OnSyncDevices != nil {
+					var p wsDevicesPayload
+					if err := json.Unmarshal(m.Data, &p); err == nil {
+						users := make(map[int][]string, len(p.Users))
+						for k, v := range p.Users {
+							if id, err := strconv.Atoi(k); err == nil {
+								users[id] = v
+							}
+						}
+						h.OnSyncDevices(users)
+					}
+				}
 			}
 		}
 	}()
