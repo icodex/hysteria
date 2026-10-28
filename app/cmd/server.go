@@ -125,7 +125,7 @@ func (c *v2boardConfig) intervals() (pull, push time.Duration) {
 	if c.PushInterval > 0 {
 		push = c.PushInterval
 	}
-	return
+	return pull, push
 }
 
 type serverConfigRealm struct {
