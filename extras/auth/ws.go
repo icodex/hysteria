@@ -32,6 +32,10 @@ type WSHandlers struct {
 	DeviceSnapshot func() map[int][]string
 	// DeviceReportInterval 为 0 时默认 60s
 	DeviceReportInterval time.Duration
+	// StatusCollector 非 nil 时定期上报 node.status（负载/指标），间隔同 DeviceReportInterval
+	StatusCollector func() map[string]any
+	// OnlineConnSnapshot 返回 {uid: 活跃连接数}，随 node.status 一并上报 online
+	OnlineConnSnapshot func() map[string]int
 }
 
 type wsHandshakeResponse struct {
@@ -146,7 +150,7 @@ func RunWSClient(wsURL, token string, nodeID int, h WSHandlers) error {
 		}
 	}()
 
-	// 定期上报本地在线设备，驱动面板 device_limit 全局视图与在线数展示
+	// 定期上报本地在线设备与节点状态，驱动面板在线数/负载/指标展示
 	if h.DeviceSnapshot != nil {
 		interval := h.DeviceReportInterval
 		if interval <= 0 {
@@ -161,17 +165,28 @@ func RunWSClient(wsURL, token string, nodeID int, h WSHandlers) error {
 					return
 				case <-reportTicker.C:
 				}
-				snap := h.DeviceSnapshot()
-				if len(snap) == 0 {
-					continue
+				if snap := h.DeviceSnapshot(); len(snap) > 0 {
+					if data, merr := json.Marshal(map[string]any{"node_id": h.NodeID, "devices": snap}); merr == nil {
+						if err := writeJSON(wsMessage{Event: "report.devices", Data: data}); err != nil {
+							errChan <- err
+							return
+						}
+					}
 				}
-				data, merr := json.Marshal(map[string]any{"node_id": h.NodeID, "devices": snap})
-				if merr != nil {
-					continue
-				}
-				if err := writeJSON(wsMessage{Event: "report.devices", Data: data}); err != nil {
-					errChan <- err
-					return
+				if h.StatusCollector != nil {
+					payload := map[string]any{"node_id": h.NodeID}
+					for k, v := range h.StatusCollector() {
+						payload[k] = v
+					}
+					if h.OnlineConnSnapshot != nil {
+						payload["online"] = h.OnlineConnSnapshot()
+					}
+					if data, merr := json.Marshal(payload); merr == nil {
+						if err := writeJSON(wsMessage{Event: "node.status", Data: data}); err != nil {
+							errChan <- err
+							return
+						}
+					}
 				}
 			}
 		}()

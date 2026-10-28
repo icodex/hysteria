@@ -1541,8 +1541,13 @@ func (c *serverConfig) fillTrafficLogger(hyConfig *server.Config) error {
 		return nil
 	}
 
+	// REST 兜底循环的 ctx：服务器进程退出时一并停（单进程单 server）
+
 	tss := trafficlogger.NewTrafficStatsServer(c.TrafficStats.Secret)
-	trafficlogger.SetSpeedThrottle(tss, auth.Throttle)
+	trafficlogger.SetSpeedThrottle(tss, func(id string, tx, rx uint64) {
+		auth.CountersTraffic(tx, rx)
+		auth.Throttle(id, tx, rx)
+	})
 	hyConfig.TrafficLogger = tss
 
 	if v2boardEnabled {
@@ -1550,10 +1555,15 @@ func (c *serverConfig) fillTrafficLogger(hyConfig *server.Config) error {
 		userURL := c.V2board.uniProxyURL("/api/v1/server/UniProxy/user")
 		pushURL := c.V2board.uniProxyURL("/api/v1/server/UniProxy/push")
 		aliveURL := c.V2board.uniProxyURL("/api/v1/server/UniProxy/alive")
+		statusURL := c.V2board.uniProxyURL("/api/v1/server/UniProxy/status")
+		onlineURL := c.V2board.uniProxyURL("/api/v1/server/UniProxy/online")
 		go auth.UpdateUsers(userURL, pullInterval, tss)
 		go tss.PushTrafficToV2boardInterval(pushURL, pushInterval)
-		// WS 推送在线时由 report.devices 上报，断开期间 REST /alive 兜底
+		// WS 推送在线时由 report.devices/node.status 上报，断开期间 REST 兜底
 		go auth.ReportDevices(aliveURL, pushInterval, auth.DeviceSnapshot)
+		go auth.ReportStatusLoop(statsLoopCtx(), statusURL, pushInterval,
+			func() map[string]any { return auth.StatusPayload(auth.CollectNodeStats(true)) })
+		go auth.ReportOnlineLoop(statsLoopCtx(), onlineURL, pushInterval, auth.OnlineConnSnapshot)
 	}
 	if c.TrafficStats.Listen != "" {
 		go runTrafficStatsServer(c.TrafficStats.Listen, tss)
@@ -1754,18 +1764,24 @@ func (c *serverConfig) Config() (*server.Config, error) {
 }
 
 type ResponseNodeInfo struct {
-	Host         string `json:"host"`
-	ServerPort   uint   `json:"server_port"`
-	ServerName   string `json:"server_name"`
-	UpMbps       uint   `json:"down_mbps"`
-	DownMbps     uint   `json:"up_mbps"`
-	Version      int    `json:"version"`
-	Obfs         string `json:"obfs"`
-	ObfsPassword string `json:"obfs-password"`
-	BaseConfig   struct {
+	Host           string `json:"host"`
+	ListenIP       string `json:"listen_ip"`
+	ServerPort     uint   `json:"server_port"`
+	ServerName     string `json:"server_name"`
+	UpMbps         uint   `json:"down_mbps"`
+	DownMbps       uint   `json:"up_mbps"`
+	Version        int    `json:"version"`
+	Obfs           string `json:"obfs"`
+	ObfsPassword   string `json:"obfs-password"`
+	KernelLogLevel string `json:"kernel_log_level,omitempty"`
+	BaseConfig     struct {
 		PushInterval int `json:"push_interval"`
 		PullInterval int `json:"pull_interval"`
 	} `json:"base_config"`
+	Routes          []auth.PanelRouteRule       `json:"routes"`
+	CustomRoutes    []auth.PanelCustomRouteRule `json:"custom_routes"`
+	CustomOutbounds []auth.PanelOutbound        `json:"custom_outbounds"`
+	CertConfig      *auth.PanelCertConfig       `json:"cert_config"`
 }
 
 func runServerCmd(cmd *cobra.Command, args []string) {
@@ -1818,6 +1834,7 @@ func runServer(v *viper.Viper) {
 			config.Obfs.Type = "salamander"
 			config.Obfs.Salamander.Password = obfsPassword
 		}
+		applyPanelNodeConfig(logger, &config, responseNodeInfo)
 		v2boardWatchURL = nodeInfoUrl
 		v2boardInitialInfo = responseNodeInfo
 		v2boardPullInterval, _ = config.V2board.intervals()
@@ -1901,12 +1918,17 @@ func runServer(v *viper.Viper) {
 			OnSyncDevices:        auth.SetGlobalDevices,
 			DeviceSnapshot:       auth.DeviceSnapshot,
 			DeviceReportInterval: pushInterval,
+			StatusCollector: func() map[string]any {
+				return auth.StatusPayload(auth.CollectNodeStats(true))
+			},
+			OnlineConnSnapshot: auth.OnlineConnSnapshot,
 		})
 	}
 
 	select {
 	case <-signalChan:
 		logger.Info("received signal, shutting down gracefully")
+		stopStatsLoops()
 		if err := s.Close(); err != nil {
 			logger.Error("failed to shut down server cleanly", zap.Error(err))
 		}
@@ -1915,6 +1937,7 @@ func runServer(v *viper.Viper) {
 		}
 	case <-configChangeChan:
 		logger.Info("panel node config changed, restarting server to apply")
+		stopStatsLoops()
 		if err := s.Close(); err != nil {
 			logger.Error("failed to shut down server cleanly", zap.Error(err))
 		}
@@ -2032,11 +2055,13 @@ type serverLogger struct{}
 
 func (l *serverLogger) Connect(addr net.Addr, id string, tx uint64) {
 	auth.TrackConnect(id, addr)
+	auth.CountersConnect()
 	logger.Info("client connected", zap.String("addr", addr.String()), zap.String("id", id), zap.Uint64("tx", tx))
 }
 
 func (l *serverLogger) Disconnect(addr net.Addr, id string, err error) {
 	auth.TrackDisconnect(id, addr)
+	auth.CountersDisconnect()
 	logger.Info("client disconnected", zap.String("addr", addr.String()), zap.String("id", id), zap.Error(err))
 }
 
