@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -1779,10 +1780,24 @@ type ResponseNodeInfo struct {
 		PushInterval int `json:"push_interval"`
 		PullInterval int `json:"pull_interval"`
 	} `json:"base_config"`
-	Routes          []auth.PanelRouteRule       `json:"routes"`
-	CustomRoutes    []auth.PanelCustomRouteRule `json:"custom_routes"`
-	CustomOutbounds []auth.PanelOutbound        `json:"custom_outbounds"`
-	CertConfig      *auth.PanelCertConfig       `json:"cert_config"`
+	Routes []auth.PanelRouteRule `json:"routes"`
+	// CustomRoutes raw 内核私有格式，此节点不消费，保留字段兼容
+	// （结构化跨内核规则走 CustomRouteRules）
+	CustomRoutes     json.RawMessage             `json:"custom_routes"`
+	CustomRouteRules []auth.PanelCustomRouteRule `json:"custom_route_rules,omitempty"`
+	CustomOutbounds  []auth.PanelOutbound        `json:"custom_outbounds"`
+	CertConfig       *auth.PanelCertConfig       `json:"cert_config"`
+	// 面板下发的 fork 策略字段（仅 hysteria 后端消费），形状与 server.yaml 各段一致
+	Sniff                   *panelSniffPayload      `json:"sniff,omitempty"`
+	Masquerade              *panelMasqueradePayload `json:"masquerade,omitempty"`
+	Quic                    *panelQUICPayload       `json:"quic,omitempty"`
+	Congestion              *panelCongestionPayload `json:"congestion,omitempty"`
+	Resolver                *panelResolverPayload   `json:"resolver,omitempty"`
+	DisableUDP              bool                    `json:"disable_udp,omitempty"`
+	UDPIdleTimeout          int                     `json:"udp_idle_timeout,omitempty"` // 秒
+	IgnoreClientBandwidth   bool                    `json:"ignore_client_bandwidth,omitempty"`
+	DisableLossCompensation bool                    `json:"disable_loss_compensation,omitempty"` // bandwidth 补偿开关
+	TLSSettings             map[string]any          `json:"tls_settings,omitempty"`              // 仅消费 ech 段
 }
 
 func runServerCmd(cmd *cobra.Command, args []string) {
@@ -1974,7 +1989,47 @@ func v2boardNodeInfoChanged(a, b ResponseNodeInfo) bool {
 		a.Version != b.Version ||
 		a.UpMbps != b.UpMbps ||
 		a.DownMbps != b.DownMbps ||
-		v2boardObfsPassword(a) != v2boardObfsPassword(b)
+		v2boardObfsPassword(a) != v2boardObfsPassword(b) ||
+		panelPolicyChanged(a, b)
+}
+
+// panelPolicyChanged 面板策略字段比较：指针/切片字段一边 nil 一边非 nil 判变，
+// 同非 nil 时 reflect.DeepEqual；标量开关直接 !=。任一差异即触发重启拉新配置。
+func panelPolicyChanged(a, b ResponseNodeInfo) bool {
+	if (a.Sniff == nil) != (b.Sniff == nil) ||
+		(a.Masquerade == nil) != (b.Masquerade == nil) ||
+		(a.Quic == nil) != (b.Quic == nil) ||
+		(a.Congestion == nil) != (b.Congestion == nil) ||
+		(a.Resolver == nil) != (b.Resolver == nil) ||
+		(a.TLSSettings == nil) != (b.TLSSettings == nil) ||
+		(a.CustomRouteRules == nil) != (b.CustomRouteRules == nil) {
+		return true
+	}
+	if a.Sniff != nil && !reflect.DeepEqual(a.Sniff, b.Sniff) {
+		return true
+	}
+	if a.Masquerade != nil && !reflect.DeepEqual(a.Masquerade, b.Masquerade) {
+		return true
+	}
+	if a.Quic != nil && !reflect.DeepEqual(a.Quic, b.Quic) {
+		return true
+	}
+	if a.Congestion != nil && !reflect.DeepEqual(a.Congestion, b.Congestion) {
+		return true
+	}
+	if a.Resolver != nil && !reflect.DeepEqual(a.Resolver, b.Resolver) {
+		return true
+	}
+	if a.TLSSettings != nil && !reflect.DeepEqual(a.TLSSettings, b.TLSSettings) {
+		return true
+	}
+	if !reflect.DeepEqual(a.CustomRouteRules, b.CustomRouteRules) {
+		return true
+	}
+	return a.DisableUDP != b.DisableUDP ||
+		a.UDPIdleTimeout != b.UDPIdleTimeout ||
+		a.IgnoreClientBandwidth != b.IgnoreClientBandwidth ||
+		a.DisableLossCompensation != b.DisableLossCompensation
 }
 
 func watchV2boardConfig(ctx context.Context, nodeInfoURL string, interval time.Duration, initial ResponseNodeInfo, changed chan<- struct{}) {
