@@ -114,6 +114,37 @@ func TestRunWSClientEvents(t *testing.T) {
 	mu.Unlock()
 }
 
+func TestRunWSClientReadTimeout(t *testing.T) {
+	// 对端保持静默且不回 pong：客户端必须靠读超时自己放弃，
+	// 否则半开连接会让 WSActive 永远为 true，REST 轮询一直被跳过。
+	oldTimeout := wsReadTimeout
+	wsReadTimeout = 200 * time.Millisecond
+	defer func() { wsReadTimeout = oldTimeout }()
+
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		_ = c.WriteJSON(map[string]any{"event": "auth.success"})
+		// 之后不再写任何数据，也不回 pong
+		for {
+			if _, _, err := c.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+
+	start := time.Now()
+	err := RunWSClient("ws"+strings.TrimPrefix(srv.URL, "http"), "tok", 7, WSHandlers{})
+	assert.Error(t, err)
+	assert.Less(t, time.Since(start), 2*time.Second)
+	assert.False(t, WSActive.Load())
+}
+
 func TestReconnectLoopDisabled(t *testing.T) {
 	// 面板未启用 WS：ReconnectLoop 应静默等待而不是忙转
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

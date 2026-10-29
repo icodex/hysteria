@@ -93,6 +93,12 @@ type wsDevicesPayload struct {
 	Users map[string][]string `json:"users"`
 }
 
+// wsKeepaliveInterval 控制帧 ping 间隔；同时兼作应用层 pong（维持面板 node_ws_alive）
+const wsKeepaliveInterval = 30 * time.Second
+
+// wsReadTimeout 读超时，变量形式便于测试压缩。见 RunWSClient 内的半开连接说明。
+var wsReadTimeout = 90 * time.Second
+
 // RunWSClient 连接面板 WS 并处理推送，连接期间置 WSActive，断开时返回
 func RunWSClient(wsURL, token string, nodeID int, h WSHandlers) error {
 	u, err := url.Parse(wsURL)
@@ -115,7 +121,18 @@ func RunWSClient(wsURL, token string, nodeID int, h WSHandlers) error {
 	defer WSActive.Store(false)
 	log.Printf("v2board WS connected: %s", wsURL)
 
-	pingTicker := time.NewTicker(30 * time.Second)
+	// 半开连接检测：面板每 55s 发应用层 ping、Workerman 对控制帧 ping 自动回 pong，
+	// 因此 90s 内无任何入站数据即可判定链路已死。没有这条读超时，NAT 超时或
+	// 对端僵死时 ReadMessage 会无限阻塞，WSActive 一直是 true，REST 轮询被跳过，
+	// 配置/用户更新要等到 TCP 重传超时（十几分钟）才恢复。
+	extendReadDeadline := func() { _ = conn.SetReadDeadline(time.Now().Add(wsReadTimeout)) }
+	extendReadDeadline()
+	conn.SetPongHandler(func(string) error {
+		extendReadDeadline()
+		return nil
+	})
+
+	pingTicker := time.NewTicker(wsKeepaliveInterval)
 	defer pingTicker.Stop()
 	errChan := make(chan error, 4)
 	// done 关闭后所有辅助 goroutine 退出，避免每次重连泄漏
@@ -199,6 +216,7 @@ func RunWSClient(wsURL, token string, nodeID int, h WSHandlers) error {
 				errChan <- err
 				return
 			}
+			extendReadDeadline()
 			var m wsMessage
 			if err := json.Unmarshal(msg, &m); err != nil {
 				continue
